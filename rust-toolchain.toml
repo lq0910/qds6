@@ -1,0 +1,5 @@
+# 功能：固定开发与 CI 使用的 Rust 工具链；时间：2026-11-10；作者：lq。
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

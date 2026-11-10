@@ -1,0 +1,16 @@
+# 功能：SQLite 非秘密配置存储；时间：2026-11-10；作者：lq。
+[package]
+name = "qds6-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+qds6-core.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

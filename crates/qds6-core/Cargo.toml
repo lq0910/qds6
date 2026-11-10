@@ -1,0 +1,18 @@
+# 功能：独立于 UI 和网络的领域模型；时间：2026-11-10；作者：lq。
+[package]
+name = "qds6-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

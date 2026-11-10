@@ -1,0 +1,38 @@
+# 功能：QDS6 原生桌面工程与统一依赖；时间：2026-11-10；作者：lq。
+[workspace]
+members = ["crates/qds6-core", "crates/qds6-storage", "crates/qds6-app"]
+default-members = ["crates/qds6-app"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["lq"]
+rust-version = "1.99"
+
+[workspace.dependencies]
+qds6-core = { path = "crates/qds6-core" }
+qds6-storage = { path = "crates/qds6-storage" }
+# 与官方清单保持同一个来源；禁止同时引入另一套 GPUI 类型。
+gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "ab7bd640021e062094cb4fd1e15fc6b465ec6a47", features = ["tree-sitter-sql"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+thiserror = "2"
+directories = "6"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+
+[profile.dev]
+debug = "limited"
+
+[profile.release]
+strip = "symbols"
+lto = "thin"

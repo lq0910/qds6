@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 功能：QDS6 应用图标矢量母版，Q 与连接端点组合；时间：2026-11-10；作者：lq。 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>QDS6 — Connections, simplified.</title>
+  <desc>A porcelain Q with a mint connection endpoint on a midnight rounded square.</desc>
+  <defs>
+    <linearGradient id="surface" x1="140" y1="100" x2="870" y2="930" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#203E46"/>
+      <stop offset="0.55" stop-color="#122C34"/>
+      <stop offset="1" stop-color="#0A1D26"/>
+    </linearGradient>
+    <linearGradient id="link" x1="570" y1="570" x2="742" y2="742" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#A4F2D7"/>
+      <stop offset="1" stop-color="#54D9B1"/>
+    </linearGradient>
+  </defs>
+  <!-- 功能：保留透明安全边距，适配桌面图标栅格；时间：2026-11-10；作者：lq。 -->
+  <rect x="80" y="80" width="864" height="864" rx="196" fill="url(#surface)"/>
+  <rect x="82" y="82" width="860" height="860" rx="194" fill="none" stroke="#FFFFFF" stroke-opacity="0.09" stroke-width="4"/>
+  <!-- 功能：品牌 Q 主环与单一连接尾笔，避免小尺寸文字；时间：2026-11-10；作者：lq。 -->
+  <circle cx="482" cy="478" r="216" fill="none" stroke="#F2FAF7" stroke-width="86"/>
+  <path d="M575 571 731 727" fill="none" stroke="url(#link)" stroke-width="86" stroke-linecap="round"/>
+  <circle cx="731" cy="727" r="21" fill="#12333A"/>
+</svg>
