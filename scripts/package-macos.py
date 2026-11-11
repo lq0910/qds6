@@ -29,7 +29,11 @@ def run():
     parser = argparse.ArgumentParser()
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--output", type=Path)
+    # 功能：允许内部更新使用独立构建号并写入内容清单，区分同版本安装包；时间：2026-11-11；作者：lq。
+    parser.add_argument("--build-number", default="2026111101")
     options = parser.parse_args()
+    if not options.build_number.isascii() or not options.build_number.isdigit():
+        raise SystemExit("构建号须为 ASCII 数字")
     if platform.system() != "Darwin" or platform.machine() != "arm64":
         raise SystemExit("当前脚本仅打包已验收的 Apple Silicon macOS 构建")
     version = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["package"]["version"]
@@ -64,7 +68,7 @@ def run():
         plistlib.dump({
             "CFBundleName": "QDS6", "CFBundleDisplayName": "QDS6", "CFBundleExecutable": "qds6",
             "CFBundleIdentifier": "local.qds6.desktop", "CFBundlePackageType": "APPL",
-            "CFBundleShortVersionString": version, "CFBundleVersion": "2026111101",
+            "CFBundleShortVersionString": version, "CFBundleVersion": options.build_number,
             "CFBundleIconFile": "qds6.icns", "LSMinimumSystemVersion": "14.0",
             "NSHighResolutionCapable": True, "NSPrincipalClass": "NSApplication",
             "LSApplicationCategoryType": "public.app-category.developer-tools",
@@ -78,6 +82,7 @@ def run():
     manifest = {
         "description": "功能：未提交工作树与发行构建内容指纹；时间：2026-11-11；作者：lq。",
         "version": version, "channel": "internal", "platform": "aarch64-apple-darwin",
+        "build_number": options.build_number,
         "baseline_commit": command(["git", "rev-parse", "HEAD"]).strip(),
         "working_tree_has_changes": bool(command(["git", "status", "--porcelain"]).strip()),
         "cargo_lock_sha256": sha256(ROOT / "Cargo.lock"),

@@ -48,7 +48,8 @@ impl ProfileStore {
         if version > 1 {
             return Err(StoreError::NewerSchema);
         }
-        let tx = db.transaction()?;
+        // 功能：启动并发读取连接和偏好时先取得初始化写锁，避免延迟事务升级互锁导致主题读取失败；时间：2026-11-11；作者：lq。
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute_batch("CREATE TABLE IF NOT EXISTS profiles (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL); PRAGMA user_version = 1;")?;
         // 功能：增量建立软件偏好表，保留所有已有连接；时间：2026-11-11；作者：lq。
         tx.execute_batch("CREATE TABLE IF NOT EXISTS preferences (id INTEGER PRIMARY KEY CHECK (id = 1), body TEXT NOT NULL);")?;

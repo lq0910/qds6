@@ -2,6 +2,89 @@
 
 use super::*;
 
+// 功能：通过平台对话框响应验证选择、取消和预览失效，不读取用户文件；时间：2026-11-11；作者：lq。
+#[cfg(all(test, feature = "ui-tests"))]
+mod tests {
+    use super::Workbench;
+    use gpui_kit::{AppContext, TestAppContext, WindowOptions};
+
+    /// 功能：选择新路径清空旧预览，取消保留预览，忙碌时禁止再打开对话框；时间：2026-11-11；作者：lq。
+    #[test]
+    fn backup_picker_selection_and_cancellation() {
+        let temporary = std::env::temp_dir().join(format!("qds6-picker-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&temporary).unwrap();
+        let mut cx = TestAppContext::single();
+        cx.skip_drawing();
+        cx.update(gpui_kit::init);
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    Workbench::new_with_store(
+                        Some(temporary.join("connections.sqlite3")),
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .unwrap()
+        });
+        let selected = temporary.join("中文备份.json");
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |state, cx| {
+                state.services.backup_mode = 1;
+                state.services.preview = Some(qds6_services::backup::Configuration::new(&[]));
+                state.services.import_report = vec!["旧报告".into()];
+                state.choose_backup_file(window, cx);
+            });
+        })
+        .unwrap();
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(|options| {
+            assert!(options.files && !options.directories && !options.multiple);
+            Some(vec![selected.clone()])
+        });
+        cx.run_until_parked();
+        cx.read(|cx| {
+            let state = view.read(cx);
+            assert_eq!(
+                state.services.backup_path.read(cx).value().as_str(),
+                selected.to_str().unwrap()
+            );
+            assert!(state.services.preview.is_none());
+            assert!(state.services.import_report.is_empty());
+        });
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |state, cx| {
+                state.services.backup_mode = 2;
+                state.services.preview = Some(qds6_services::backup::Configuration::new(&[]));
+                state.choose_backup_file(window, cx);
+            });
+        })
+        .unwrap();
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(|_| None);
+        cx.run_until_parked();
+        cx.read(|cx| {
+            let state = view.read(cx);
+            assert_eq!(
+                state.services.backup_path.read(cx).value().as_str(),
+                selected.to_str().unwrap()
+            );
+            assert!(state.services.preview.is_some());
+        });
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |state, cx| {
+                state.services.busy = true;
+                state.choose_backup_file(window, cx);
+            });
+        })
+        .unwrap();
+        assert!(!cx.did_prompt_for_paths());
+        drop(cx);
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
+}
+
 impl Workbench {
     /// 功能：每次只展示一种操作流程，预览与危险确认跟随当前任务；时间：2026-11-11；作者：lq。
     pub fn backup_page(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -59,13 +142,31 @@ impl Workbench {
                 .child(div().text_xs().child(if mode == 0 {
                     "保存到文件（绝对路径）"
                 } else {
-                    "读取文件（绝对路径）"
+                    "导入 / 备份文件"
                 }))
                 .child(
-                    Input::new(&self.services.backup_path)
-                        .id("backup-file-path")
-                        .aria_label("配置文件路径")
-                        .disabled(self.services.busy),
+                    // 功能：导入和恢复使用系统文件选择器，路径仍可粘贴；时间：2026-11-11；作者：lq。
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            div().flex_1().min_w_0().child(
+                                Input::new(&self.services.backup_path)
+                                    .id("backup-file-path")
+                                    .aria_label("配置文件路径")
+                                    .disabled(self.services.busy),
+                            ),
+                        )
+                        .when(mode != 0, |row| {
+                            row.child(
+                                Button::new("choose-backup-file")
+                                    .icon(UiIcon::FolderOpen)
+                                    .label("选择文件…")
+                                    .disabled(self.services.busy)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.choose_backup_file(window, cx)
+                                    })),
+                            )
+                        }),
                 ),
         );
         if mode != 1 {
@@ -260,7 +361,7 @@ impl Workbench {
                     .border_color(cx.theme().border)
                     .child(Self::section_heading(
                         "本机快照回滚",
-                        "仅适用于同一 Mac；上方填写快照文件路径，凭据仍依赖原 Keychain。",
+                        "仅适用于同一 Mac；在上方选择快照文件，凭据仍依赖原 Keychain。",
                         cx,
                     ))
                     .child(
@@ -268,7 +369,7 @@ impl Workbench {
                             Button::new("rollback-local-snapshot")
                                 .ghost()
                                 .small()
-                                .label("回滚所填路径的本机快照…")
+                                .label("回滚所选本机快照…")
                                 .disabled(self.services.busy)
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.rollback_configuration(window, cx)
@@ -301,6 +402,44 @@ impl Workbench {
                     .child(h_flex().child(modes))
                     .child(content),
             )
+    }
+
+    /// 功能：原生单文件选择用于外部导入和备份恢复，取消保留路径与预览；时间：2026-11-11；作者：lq。
+    fn choose_backup_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.services.busy {
+            return;
+        }
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("选择导入或备份文件".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| match paths.await {
+            Ok(Ok(Some(paths))) => {
+                if let Some(path) = paths.first() {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.services.backup_path.update(cx, |input, cx| {
+                            input.set_value(path.display().to_string(), window, cx)
+                        });
+                        this.services.preview = None;
+                        this.services.import_report.clear();
+                        this.error = false;
+                        this.status = "文件已选择，请解析并核对预览后再确认写入".into();
+                        cx.notify();
+                    });
+                }
+            }
+            Ok(Ok(None)) => {}
+            _ => {
+                let _ = this.update(cx, |this, cx| {
+                    this.status = "无法打开文件选择器，请重试或粘贴文件路径".into();
+                    this.error = true;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     /// 功能：沿用后台加密与新文件写入，明文导出始终排除凭据；时间：2026-11-11；作者：lq。

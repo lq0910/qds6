@@ -4,6 +4,10 @@ use super::*;
 use qds6_services::updates::{self, UpdateCheck};
 use qds6_storage::{AppPreferences, ColorTheme};
 
+// 功能：原生外观专项验收仅进入显式测试构建；时间：2026-11-11；作者：lq。
+#[cfg(feature = "ui-tests")]
+pub(crate) mod appearance_smoke;
+
 /// 功能：设置读写与更新检查独立管理，避免取消业务任务；时间：2026-11-11；作者：lq。
 pub(super) struct SettingsUi {
     pub(super) preferences: AppPreferences,
@@ -16,6 +20,8 @@ pub(super) struct SettingsUi {
     qq_copied: bool,
     task: Option<Task<()>>,
     update_task: Option<Task<()>>,
+    // 功能：独立保留系统外观订阅，替换连接表单不取消监听；时间：2026-11-11；作者：lq。
+    appearance_subscription: Option<Subscription>,
 }
 
 impl Default for SettingsUi {
@@ -32,11 +38,23 @@ impl Default for SettingsUi {
             qq_copied: false,
             task: None,
             update_task: None,
+            appearance_subscription: None,
         }
     }
 }
 
 impl Workbench {
+    /// 功能：仅自动模式响应系统外观变化，订阅随设置视图销毁；时间：2026-11-11；作者：lq。
+    pub(super) fn watch_system_appearance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.appearance_subscription =
+            Some(cx.observe_window_appearance(window, |this, window, cx| {
+                if this.settings.preferences.theme == ColorTheme::System {
+                    Theme::sync_system_appearance(Some(window), cx);
+                    cx.notify();
+                }
+            }));
+    }
+
     /// 功能：可点击的四套终端配色预览，浅深色固定各两套且独立保存；时间：2026-11-11；作者：lq。
     fn terminal_theme_picker(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let mut choices = h_flex().w_full().gap_3();
@@ -171,14 +189,12 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        Theme::change(
-            match preferences.theme {
-                ColorTheme::Light => ThemeMode::Light,
-                ColorTheme::Dark => ThemeMode::Dark,
-            },
-            Some(window),
-            cx,
-        );
+        // 功能：自动模式读取当前原生窗口外观，手动模式不受系统变化覆盖；时间：2026-11-11；作者：lq。
+        match preferences.theme {
+            ColorTheme::Light => Theme::change(ThemeMode::Light, Some(window), cx),
+            ColorTheme::Dark => Theme::change(ThemeMode::Dark, Some(window), cx),
+            ColorTheme::System => Theme::sync_system_appearance(Some(window), cx),
+        }
         // 功能：只应用实际变化的编辑偏好，切换主题不重置终端临时缩放；时间：2026-11-11；作者：lq。
         if !self.settings.ready
             || preferences.sql_soft_wrap != self.settings.preferences.sql_soft_wrap
@@ -323,15 +339,21 @@ impl Workbench {
         let theme = TabBar::new("settings-theme")
             .segmented()
             .small()
-            .selected_index(usize::from(cx.theme().mode.is_dark()))
+            // 功能：选中保存的模式，自动模式不会因系统浅深色而跳到手动选项；时间：2026-11-11；作者：lq。
+            .selected_index(match preferences.theme {
+                ColorTheme::Light => 0,
+                ColorTheme::Dark => 1,
+                ColorTheme::System => 2,
+            })
             .child(Tab::new().label("浅色").disabled(disabled))
             .child(Tab::new().label("深色").disabled(disabled))
+            .child(Tab::new().label("自动").disabled(disabled))
             .on_click(cx.listener(|this, index: &usize, window, cx| {
                 let mut preferences = this.settings.preferences.clone();
-                preferences.theme = if *index == 0 {
-                    ColorTheme::Light
-                } else {
-                    ColorTheme::Dark
+                preferences.theme = match *index {
+                    0 => ColorTheme::Light,
+                    1 => ColorTheme::Dark,
+                    _ => ColorTheme::System,
                 };
                 this.save_preferences(preferences, window, cx);
             }));
@@ -415,7 +437,7 @@ impl Workbench {
                             .child(Self::section_heading("常用设置", "", cx))
                             .child(Self::preference_row(
                                 "界面主题",
-                                "调整工作区的浅色或深色外观。",
+                                "选择浅色、深色，或自动跟随系统外观。",
                                 theme,
                                 cx,
                             ))

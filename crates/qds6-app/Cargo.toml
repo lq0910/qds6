@@ -52,5 +52,10 @@ required-features = ["ui-tests"]
 name = "group-smoke"
 required-features = ["ui-tests"]
 
+# 功能：实际接收 macOS 原生外观通知，验收自动主题；时间：2026-11-11；作者：lq。
+[[example]]
+name = "appearance-smoke"
+required-features = ["ui-tests"]
+
 [lints]
 workspace = true

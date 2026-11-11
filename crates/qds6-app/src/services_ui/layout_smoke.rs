@@ -1,4 +1,4 @@
-//! 功能：隔离配置下验证原生标签、任务分组和两种窗口尺寸；时间：2026-11-11；作者：lq。
+//! 功能：隔离配置下验证原生标签、任务分组和默认/最小窗口尺寸；时间：2026-11-11；作者：lq。
 
 use super::*;
 use crate::workspace_ui::{WorkspaceArea, WorkspaceTarget};
@@ -111,7 +111,7 @@ pub fn run_layout_smoke() {
     });
     cx.run_until_parked();
     settle_preferences(&mut cx, &view);
-    for (width, height) in [(1440., 900.), (960., 640.)] {
+    for (width, height) in [(1200., 780.), (960., 640.)] {
         let tag = format!("{}x{}", width as u32, height as u32);
         cx.update_window(handle, |_, window, cx| {
             window.resize(size(px(width), px(height)));
@@ -294,6 +294,72 @@ pub fn run_layout_smoke() {
         })
         .unwrap();
         capture(&mut cx, handle, &format!("backup-dark-{tag}"));
+        // 功能：导入/恢复均可选择文件，小窗口按钮不溢出；SSH 预览不修改现有连接；时间：2026-11-11；作者：lq。
+        let import_path = temporary.join("测试_connect_config.json");
+        std::fs::write(
+            &import_path,
+            r#"{"name":"导入测试","host":"localhost","port":2222,"user_name":"test","conection_type":100,"proxy_id":"0","authentication_type":2,"secret_key_id":"test-key"}"#,
+        ).unwrap();
+        let profile_count = cx.update(|cx| view.read(cx).profiles.len());
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |state, cx| {
+                state.services.backup_mode = 1;
+                state.services.import_source = 1;
+                state.services.backup_path.update(cx, |input, cx| {
+                    input.set_value(import_path.display().to_string(), window, cx);
+                });
+            });
+            window.render_frame(cx);
+            let chooser = window.find("choose-backup-file");
+            assert!(chooser.visible());
+            let chooser = chooser.bounds();
+            let input = window.find("backup-file-path").bounds();
+            assert!(input.right() <= chooser.origin.x);
+            assert!(chooser.right() <= window.viewport_size().width);
+            window.click("preview-import", cx);
+        })
+        .unwrap();
+        let started = std::time::Instant::now();
+        loop {
+            cx.run_until_parked();
+            if cx.update(|cx| !view.read(cx).services.busy) {
+                break;
+            }
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        cx.update(|cx| {
+            let state = view.read(cx);
+            assert!(!state.error, "{}", state.status);
+            assert_eq!(state.services.preview.as_ref().unwrap().profiles.len(), 1);
+            assert!(
+                state
+                    .services
+                    .import_report
+                    .iter()
+                    .any(|w| w.contains("私钥需重新选择"))
+            );
+            assert_eq!(state.profiles.len(), profile_count);
+        });
+        capture(&mut cx, handle, &format!("finalshell-preview-{tag}"));
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |state, cx| {
+                state.services.backup_mode = 2;
+                state.services.preview = None;
+                state.services.import_report.clear();
+                cx.notify();
+            });
+            window.render_frame(cx);
+            assert!(window.find("choose-backup-file").visible());
+        })
+        .unwrap();
+        capture(&mut cx, handle, &format!("restore-file-{tag}"));
+        cx.update(|cx| {
+            view.update(cx, |state, cx| {
+                state.services.backup_mode = 0;
+                cx.notify();
+            });
+        });
         // 功能：底部设置入口可见，设置页面可滚动访问二维码，返回不销毁草稿；时间：2026-11-11；作者：lq。
         cx.update_window(handle, |_, window, cx| {
             assert!(window.find("open-settings").visible());
@@ -322,8 +388,43 @@ pub fn run_layout_smoke() {
         .unwrap();
         settle_preferences(&mut cx, &view);
         capture(&mut cx, handle, &format!("settings-light-{tag}"));
+        // 功能：真实点击自动选项和标题栏三态循环，检查即时外观及 SQLite 保存；时间：2026-11-11；作者：lq。
+        cx.update_window(handle, |_, window, cx| {
+            window.within("settings-theme").click(2usize, cx);
+        })
+        .unwrap();
+        settle_preferences(&mut cx, &view);
+        cx.update_window(handle, |_, window, cx| {
+            assert_eq!(
+                view.read(cx).settings.preferences.theme,
+                qds6_storage::ColorTheme::System
+            );
+            assert_eq!(cx.theme().mode, ThemeMode::from(window.appearance()));
+            assert!(window.within("settings-theme").find(2usize).visible());
+        })
+        .unwrap();
+        capture(&mut cx, handle, &format!("settings-auto-{tag}"));
+        for theme in [
+            qds6_storage::ColorTheme::Light,
+            qds6_storage::ColorTheme::Dark,
+            qds6_storage::ColorTheme::System,
+        ] {
+            cx.update_window(handle, |_, window, cx| window.click("theme", cx))
+                .unwrap();
+            settle_preferences(&mut cx, &view);
+            cx.update_window(handle, |_, window, cx| {
+                assert_eq!(view.read(cx).settings.preferences.theme, theme);
+                let expected = match theme {
+                    qds6_storage::ColorTheme::Light => ThemeMode::Light,
+                    qds6_storage::ColorTheme::Dark => ThemeMode::Dark,
+                    qds6_storage::ColorTheme::System => ThemeMode::from(window.appearance()),
+                };
+                assert_eq!(cx.theme().mode, expected);
+            })
+            .unwrap();
+        }
         // 功能：仅显式启用时真实点击更新检查，普通布局回归不依赖公网；时间：2026-11-11；作者：lq。
-        if width == 1440. && std::env::var("QDS6_LIVE_UPDATE_CHECK").as_deref() == Ok("1") {
+        if width == 1200. && std::env::var("QDS6_LIVE_UPDATE_CHECK").as_deref() == Ok("1") {
             cx.update_window(handle, |_, window, cx| {
                 window.click("check-for-updates", cx);
                 assert!(view.read(cx).settings.checking);
@@ -541,13 +642,19 @@ pub fn run_layout_smoke() {
         })
         .unwrap();
     settle_preferences(&mut cx, &reloaded);
-    cx.update(|cx| {
+    cx.update_window(handle, |_, window, cx| {
         assert_eq!(reloaded.read(cx).settings.preferences, expected);
+        // 功能：重启后自动仍按原生外观解析，不能误当作固定浅色；时间：2026-11-11；作者：lq。
         assert_eq!(
-            cx.theme().mode.is_dark(),
-            expected.theme == qds6_storage::ColorTheme::Dark
+            cx.theme().mode,
+            match expected.theme {
+                qds6_storage::ColorTheme::Light => ThemeMode::Light,
+                qds6_storage::ColorTheme::Dark => ThemeMode::Dark,
+                qds6_storage::ColorTheme::System => ThemeMode::from(window.appearance()),
+            }
         );
-    });
+    })
+    .unwrap();
     println!(
         "PASS settings restart: reconstructed workspace loads persisted preferences and theme"
     );

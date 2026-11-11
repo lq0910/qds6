@@ -254,6 +254,7 @@ impl Workbench {
             settings: settings_ui::SettingsUi::default(),
         };
         this.watch_form(cx);
+        this.watch_system_appearance(window, cx);
         this.load(cx);
         this.load_preferences(window, cx);
         this
@@ -1268,23 +1269,39 @@ impl Render for Workbench {
                             Button::new("theme")
                                 .ghost()
                                 .small()
-                                .icon(if cx.theme().mode.is_dark() {
-                                    UiIcon::Sun
-                                } else {
-                                    UiIcon::Moon
+                                // 功能：标题栏快捷入口循环浅色、深色和自动，沿用后台持久化路径；时间：2026-11-11；作者：lq。
+                                .icon(match self.settings.preferences.theme {
+                                    qds6_storage::ColorTheme::Light => UiIcon::Moon,
+                                    qds6_storage::ColorTheme::Dark => UiIcon::RefreshCw,
+                                    qds6_storage::ColorTheme::System => UiIcon::Sun,
                                 })
-                                .label(if cx.theme().mode.is_dark() {
-                                    "浅色"
-                                } else {
-                                    "深色"
+                                .label(match self.settings.preferences.theme {
+                                    qds6_storage::ColorTheme::Light => "深色",
+                                    qds6_storage::ColorTheme::Dark => "自动",
+                                    qds6_storage::ColorTheme::System => "浅色",
+                                })
+                                .tooltip(match self.settings.preferences.theme {
+                                    qds6_storage::ColorTheme::Light => "当前：浅色；切换为深色",
+                                    qds6_storage::ColorTheme::Dark => {
+                                        "当前：深色；切换为自动（跟随系统）"
+                                    }
+                                    qds6_storage::ColorTheme::System => {
+                                        "当前：自动（跟随系统）；切换为浅色"
+                                    }
                                 })
                                 .disabled(!self.settings.ready || self.settings.saving)
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     let mut preferences = this.settings.preferences.clone();
-                                    preferences.theme = if cx.theme().mode.is_dark() {
-                                        qds6_storage::ColorTheme::Light
-                                    } else {
-                                        qds6_storage::ColorTheme::Dark
+                                    preferences.theme = match preferences.theme {
+                                        qds6_storage::ColorTheme::Light => {
+                                            qds6_storage::ColorTheme::Dark
+                                        }
+                                        qds6_storage::ColorTheme::Dark => {
+                                            qds6_storage::ColorTheme::System
+                                        }
+                                        qds6_storage::ColorTheme::System => {
+                                            qds6_storage::ColorTheme::Light
+                                        }
                                     };
                                     this.save_preferences(preferences, window, cx);
                                 })),
@@ -1383,7 +1400,8 @@ pub fn run() {
         })
         .detach();
         let mut options = TitleBar::window_options();
-        options.window_bounds = Some(WindowBounds::centered(size(px(1440.), px(900.)), cx));
+        // 功能：启动使用更紧凑的居中窗口，保留可调整尺寸和原最小窗口限制；时间：2026-11-11；作者：lq。
+        options.window_bounds = Some(WindowBounds::centered(size(px(1200.), px(780.)), cx));
         options.window_min_size = Some(size(px(960.), px(640.)));
         if let Err(error) = gpui_kit::open_window(options, cx, |window, cx| {
             window.set_window_title("QDS6");
@@ -1464,6 +1482,9 @@ pub use smoke::run_ui_smoke;
 // 功能：独立布局回归覆盖最小窗口、标签和任务入口；时间：2026-11-11；作者：lq。
 #[cfg(feature = "ui-tests")]
 pub use services_ui::run_layout_smoke;
+// 功能：公开隔离的原生自动主题验收入口；时间：2026-11-11；作者：lq。
+#[cfg(feature = "ui-tests")]
+pub use settings_ui::appearance_smoke::run_appearance_smoke;
 // 功能：文件夹分组验收只在测试构建开放；时间：2026-11-11；作者：lq。
 #[cfg(feature = "ui-tests")]
 pub use connection_groups::smoke::run_group_smoke;

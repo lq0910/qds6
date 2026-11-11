@@ -11,6 +11,8 @@ pub enum ColorTheme {
     #[default]
     Light,
     Dark,
+    /// 功能：保存跟随系统的选择，而非当前解析出的浅深色；时间：2026-11-11；作者：lq。
+    System,
 }
 
 /// 功能：常用偏好允许旧记录缺字段，终端字号限于可用范围；时间：2026-11-11；作者：lq。
@@ -68,6 +70,68 @@ impl ProfileStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 功能：并发初始化数据库时连接和自动主题均可读取，防止启动竞争导致设置失效；时间：2026-11-11；作者：lq。
+    #[test]
+    fn concurrent_startup_reads_preserve_automatic_theme() {
+        let path = std::env::temp_dir().join(format!("qds6-startup-{}.sqlite3", uuid_for_test()));
+        let expected = AppPreferences {
+            theme: ColorTheme::System,
+            ..Default::default()
+        };
+        ProfileStore::open(&path)
+            .unwrap()
+            .save_preferences(&expected)
+            .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let barrier = barrier.clone();
+                let path = &path;
+                let expected = &expected;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for _ in 0..8 {
+                        let store = ProfileStore::open(path).unwrap();
+                        assert_eq!(&store.preferences().unwrap(), expected);
+                        assert!(store.list().unwrap().is_empty());
+                    }
+                });
+            }
+        });
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// 功能：三种主题均可落盘重开，兼容旧浅深色值及缺字段默认值；时间：2026-11-11；作者：lq。
+    #[test]
+    fn interface_theme_preferences_remain_backward_compatible() {
+        let path = std::env::temp_dir().join(format!("qds6-themes-{}.sqlite3", uuid_for_test()));
+        for (theme, value) in [
+            (ColorTheme::Light, "light"),
+            (ColorTheme::Dark, "dark"),
+            (ColorTheme::System, "system"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&theme).unwrap(),
+                format!("\"{value}\"")
+            );
+            let preferences: AppPreferences =
+                serde_json::from_str(&format!(r#"{{"theme":"{value}"}}"#)).unwrap();
+            assert_eq!(preferences.theme, theme);
+            let store = ProfileStore::open(&path).unwrap();
+            store.save_preferences(&preferences).unwrap();
+            drop(store);
+            assert_eq!(
+                ProfileStore::open(&path).unwrap().preferences().unwrap(),
+                preferences
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<AppPreferences>("{}").unwrap().theme,
+            ColorTheme::Light
+        );
+        std::fs::remove_file(path).unwrap();
+    }
 
     /// 功能：验证旧库默认、持久化重开、非法写入保护及连接隔离；时间：2026-11-11；作者：lq。
     #[test]

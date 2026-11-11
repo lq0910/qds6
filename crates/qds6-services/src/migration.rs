@@ -53,7 +53,23 @@ pub fn preview(source: Source, bytes: &[u8]) -> Result<Preview, String> {
         Source::Navicat => xml_import(&text, true, &mut result)?,
     }
     if result.config.profiles.is_empty() {
-        return Err("文件中没有可安全导入的受支持连接，请检查兼容报告或使用原工具重新导出".into());
+        // 功能：无可导入项时仍展示跳过原因，不把兼容报告藏在成功预览之后；时间：2026-11-11；作者：lq。
+        let reasons = result
+            .warnings
+            .iter()
+            .skip(1)
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("；");
+        return Err(format!(
+            "文件中没有可安全导入的受支持连接{}",
+            if reasons.is_empty() {
+                "，请使用原工具重新导出".into()
+            } else {
+                format!("：{reasons}")
+            }
+        ));
     }
     let mut ids = std::collections::HashSet::new();
     result.config.profiles.retain(|p| ids.insert(p.id));
@@ -196,7 +212,7 @@ fn percent_decode(text: &str) -> Result<String, String> {
     String::from_utf8(out).map_err(|_| "会话名不是 UTF-8".into())
 }
 
-/// 功能：FinalShell JSON 单项/数组；保护字段仅报告，未支持代理配置跳过；时间：2026-11-10；作者：lq。
+/// 功能：FinalShell JSON 单项/数组，兼容连接配置字段与无代理标记，保护字段仅报告；时间：2026-11-11；作者：lq。
 fn final_shell(text: &str, out: &mut Preview) -> Result<(), String> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|_| "FinalShell 文件不是支持的 JSON；不解析加密归档")?;
@@ -211,16 +227,22 @@ fn final_shell(text: &str, out: &mut Preview) -> Result<(), String> {
         if item
             .get("proxy")
             .is_some_and(|v| !v.is_null() && v != &serde_json::Value::Bool(false))
-            || item.get("proxy_id").is_some()
+            || item.get("proxy_id").is_some_and(|v| {
+                // 功能：真实连接配置用字符串 0 表示无代理，有效代理引用仍阻止直连迁移；时间：2026-11-11；作者：lq。
+                !(v.is_null()
+                    || v.as_str().is_some_and(|s| s.is_empty() || s == "0")
+                    || v.as_u64() == Some(0))
+            })
         {
             out.warnings
                 .push("FinalShell 代理配置未映射，该连接已跳过".into());
             continue;
         }
+        // 功能：连接目录 JSON 的 conection_type=100 是 SSH，旧兼容入口 type=1001 保留；时间：2026-11-11；作者：lq。
         if item
-            .get("type")
-            .and_then(|v| v.as_i64())
-            .is_some_and(|t| t != 1001)
+            .get("conection_type")
+            .is_some_and(|v| v.as_i64() != Some(100))
+            || item.get("type").is_some_and(|v| v.as_i64() != Some(1001))
         {
             out.warnings.push("FinalShell 非 SSH 类型已跳过".into());
             continue;
@@ -240,7 +262,10 @@ fn final_shell(text: &str, out: &mut Preview) -> Result<(), String> {
             out.warnings
                 .push("FinalShell 保护密码不可迁移，需要重新输入".into());
         }
-        if item.get("private_key_path").is_some() {
+        if !get("private_key_path").is_empty()
+            || !get("secret_key_id").is_empty()
+            || item.get("authentication_type").and_then(|v| v.as_u64()) == Some(2)
+        {
             out.warnings
                 .push("FinalShell 私钥需重新选择，本次未读取外部文件".into());
         }
@@ -255,6 +280,10 @@ fn final_shell(text: &str, out: &mut Preview) -> Result<(), String> {
                     "type",
                     "password",
                     "private_key_path",
+                    "proxy_id",
+                    "conection_type",
+                    "authentication_type",
+                    "secret_key_id",
                 ]
                 .contains(&k.as_str())
             })
@@ -430,6 +459,118 @@ fn xml_import(text: &str, navicat: bool, out: &mut Preview) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 功能：复现真实连接配置的无代理标记和密钥引用，基础连接可预览且秘密不落入配置；时间：2026-11-11；作者：lq。
+    #[test]
+    fn finalshell_connection_config_accepts_no_proxy_and_reports_missing_key() {
+        let input = serde_json::json!({
+            "name": "测试服务器", "host": "localhost", "port": 2222,
+            "user_name": "test", "conection_type": 100, "proxy_id": "0",
+            "authentication_type": 2, "secret_key_id": "source-key-reference",
+            "password": "opaque-source-password", "parent_id": "source-group-reference",
+            "remote_port_forwarding": {}, "port_forwarding_list": [],
+            "exec_channel_enable": true, "terminal_encoding": "UTF-8"
+        });
+        let first = preview(Source::FinalShell, &serde_json::to_vec(&input).unwrap()).unwrap();
+        assert_eq!(first.config.profiles.len(), 1);
+        let profile = &first.config.profiles[0];
+        assert_eq!(profile.protocol, Protocol::Ssh);
+        assert_eq!(profile.name, "测试服务器");
+        assert_eq!(profile.host, "localhost");
+        assert_eq!(profile.port, 2222);
+        assert_eq!(profile.username, "test");
+        assert!(profile.credential.is_none());
+        assert!(profile.ssh.private_key.is_empty());
+        assert!(first.warnings.iter().any(|w| w.contains("私钥需重新选择")));
+        assert!(first.warnings.iter().any(|w| w.contains("密码不可迁移")));
+        let serialized = serde_json::to_string(&first.config).unwrap();
+        assert!(!serialized.contains("opaque-source-password"));
+        assert!(!serialized.contains("source-key-reference"));
+        let second = preview(Source::FinalShell, &serde_json::to_vec(&input).unwrap()).unwrap();
+        assert_eq!(first.config.profiles, second.config.profiles);
+        // 功能：合成预览经正式恢复服务写入隔离 SQLite，重复导入不新增且先保存恢复点；时间：2026-11-11；作者：lq。
+        let temporary = tempfile::tempdir().unwrap();
+        let mut store =
+            qds6_storage::ProfileStore::open(temporary.path().join("profiles.sqlite3")).unwrap();
+        for (index, config) in [&first.config, &second.config].into_iter().enumerate() {
+            let snapshot = temporary.path().join(format!("before-import-{index}.json"));
+            config.restore(&mut store, &snapshot, false).unwrap();
+            assert!(snapshot.exists());
+            assert_eq!(store.list().unwrap(), first.config.profiles);
+        }
+        for proxy in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!(0),
+        ] {
+            let mut input = input.clone();
+            input["proxy_id"] = proxy;
+            assert!(preview(Source::FinalShell, &serde_json::to_vec(&input).unwrap()).is_ok());
+        }
+    }
+
+    /// 功能：有效代理与非 SSH 类型继续跳过，无有效项仍给出原因且不回显来源秘密；时间：2026-11-11；作者：lq。
+    #[test]
+    fn finalshell_rejects_real_proxy_and_non_ssh_with_reason() {
+        let base = serde_json::json!({
+            "name": "测试", "host": "localhost", "user_name": "test",
+            "conection_type": 100, "proxy_id": "0", "password": "opaque-secret"
+        });
+        for (key, value, reason) in [
+            (
+                "proxy_id",
+                serde_json::json!("actual-proxy-reference"),
+                "代理配置未映射",
+            ),
+            (
+                "proxy",
+                serde_json::json!({"host": "proxy.invalid"}),
+                "代理配置未映射",
+            ),
+            ("conection_type", serde_json::json!(101), "非 SSH 类型"),
+            (
+                "conection_type",
+                serde_json::json!("unknown"),
+                "非 SSH 类型",
+            ),
+            ("type", serde_json::json!(1002), "非 SSH 类型"),
+        ] {
+            let mut input = base.clone();
+            input[key] = value;
+            let bytes = serde_json::to_vec(&input).unwrap();
+            let error = preview(Source::FinalShell, &bytes).err().unwrap();
+            assert!(error.contains(reason), "{error}");
+            assert!(!error.contains("opaque-secret"));
+            let mixed = serde_json::to_vec(&serde_json::json!([input, base])).unwrap();
+            let result = preview(Source::FinalShell, &mixed).unwrap();
+            assert_eq!(result.config.profiles.len(), 1);
+            assert!(result.warnings.iter().any(|w| w.contains(reason)));
+        }
+    }
+
+    /// 功能：仅在人工指定样例路径时只读验证真实 FinalShell 文件，不输出主机、用户名或秘密；时间：2026-11-11；作者：lq。
+    #[test]
+    #[ignore = "须通过 QDS6_FINALSHELL_SAMPLE 显式指定用户选择的文件"]
+    fn finalshell_selected_sample_preview() {
+        let path = std::env::var_os("QDS6_FINALSHELL_SAMPLE").expect("explicit sample path");
+        let bytes = crate::backup::read_bounded(std::path::Path::new(&path)).unwrap();
+        let result = preview(Source::FinalShell, &bytes).unwrap();
+        assert!(!result.config.profiles.is_empty());
+        assert!(
+            result
+                .config
+                .profiles
+                .iter()
+                .all(|p| p.protocol == Protocol::Ssh
+                    && p.credential.is_none()
+                    && p.ssh.private_key.is_empty())
+        );
+        println!(
+            "FinalShell 只读预览通过：{} 个 SSH 连接；未写入配置或凭据",
+            result.config.profiles.len()
+        );
+    }
+
     /// 功能：合成脱敏四格式样例、幂等 ID 与恶意 XML 拒绝；不代表源工具全版本验收；时间：2026-11-10；作者：lq。
     #[test]
     fn synthetic_formats_are_conservative_and_idempotent() {
