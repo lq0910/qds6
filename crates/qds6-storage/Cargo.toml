@@ -10,6 +10,8 @@ authors.workspace = true
 qds6-core.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
+# 功能：序列化独立于连接与凭据的软件偏好；时间：2026-11-11；作者：lq。
+serde.workspace = true
 thiserror.workspace = true
 
 [lints]

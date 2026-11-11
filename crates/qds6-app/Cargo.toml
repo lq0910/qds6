@@ -14,11 +14,15 @@ path = "src/main.rs"
 gpui-kit.workspace = true
 qds6-core.workspace = true
 qds6-storage.workspace = true
+qds6-services.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+zeroize = "1"
 directories.workspace = true
 
 # 功能：仅显式验收时启用 GPUI 测试支持，不进入常规构建；时间：2026-11-10；作者：lq。
 [features]
-ui-tests = ["gpui-kit/test-support"]
+ui-tests = ["gpui-kit/test-support", "qds6-services/test-support"]
 # 功能：显式启用 M0 组件实验窗口，不进入正式客户端；时间：2026-11-10；作者：lq。
 component-lab = []
 
@@ -32,6 +36,20 @@ required-features = ["component-lab"]
 
 [[example]]
 name = "component-smoke"
+required-features = ["ui-tests"]
+
+[[example]]
+name = "service-ui-smoke"
+required-features = ["ui-tests"]
+
+# 功能：运行隔离布局和标签交互验收；时间：2026-11-11；作者：lq。
+[[example]]
+name = "layout-smoke"
+required-features = ["ui-tests"]
+
+# 功能：隔离配置下验证文件夹分组完整交互；时间：2026-11-11；作者：lq。
+[[example]]
+name = "group-smoke"
 required-features = ["ui-tests"]
 
 [lints]

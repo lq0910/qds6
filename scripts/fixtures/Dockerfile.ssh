@@ -1,0 +1,7 @@
+# 功能：隔离 SSH/SFTP/Vim/tmux 联调镜像，不包含任何业务凭据；时间：2026-11-10；作者：lq。
+FROM postgres:17
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-server vim-tiny tmux && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /run/sshd && useradd -m -s /bin/bash qds6 && echo 'qds6:qds6-fixture-only' | chpasswd
+RUN printf '\nPasswordAuthentication yes\nPermitRootLogin no\n' >> /etc/ssh/sshd_config
+EXPOSE 22
+CMD ["/usr/sbin/sshd", "-D", "-e"]

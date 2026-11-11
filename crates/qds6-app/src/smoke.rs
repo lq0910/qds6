@@ -49,7 +49,7 @@ pub fn run_ui_smoke() {
     });
     cx.run_until_parked();
     // 功能：保存彩色品牌和浅色工作区的原生 Metal 渲染证据；时间：2026-11-10；作者：lq。
-    settle(&mut cx, handle);
+    settle(&mut cx, handle, &view);
     cx.capture_screenshot(handle)
         .expect("brand Metal screenshot")
         .save(output.join("welcome-brand-light.png"))
@@ -87,15 +87,14 @@ pub fn run_ui_smoke() {
         state.profiles[0].id.to_string()
     });
     assert_eq!(ProfileStore::open(&path).unwrap().list().unwrap().len(), 1);
-    settle(&mut cx, handle);
+    settle(&mut cx, handle, &view);
     cx.capture_screenshot(handle)
         .expect("real Metal screenshot")
         .save(output.join("connection-light.png"))
         .unwrap();
     cx.update_window(handle, |_, window, cx| {
         view.update(cx, |state, cx| {
-            state.tab = 2;
-            cx.notify();
+            state.activate_workspace(workspace_ui::WorkspaceTarget::Sql, cx);
         });
         window.render_frame(cx);
         view.read(cx)
@@ -124,17 +123,18 @@ pub fn run_ui_smoke() {
     .unwrap();
     cx.run_until_parked();
     cx.update(|cx| assert!(view.read(cx).sql_dirty));
-    settle(&mut cx, handle);
+    settle(&mut cx, handle, &view);
     cx.capture_screenshot(handle)
         .unwrap()
         .save(output.join("sql-light.png"))
         .unwrap();
+    cx.update_window(handle, |_, window, cx| window.click("theme", cx))
+        .unwrap();
+    settle(&mut cx, handle, &view);
     cx.update_window(handle, |_, window, cx| {
-        window.click("theme", cx);
         assert!(cx.theme().mode.is_dark());
         view.update(cx, |state, cx| {
-            state.tab = 1;
-            cx.notify();
+            state.activate_workspace(workspace_ui::WorkspaceTarget::Connection, cx);
         });
         window.render_frame(cx);
         window.click(id.clone(), cx);
@@ -150,7 +150,7 @@ pub fn run_ui_smoke() {
     .unwrap();
     cx.run_until_parked();
     cx.update(|cx| assert_eq!(view.read(cx).profiles.len(), 1));
-    settle(&mut cx, handle);
+    settle(&mut cx, handle, &view);
     cx.capture_screenshot(handle)
         .unwrap()
         .save(output.join("connection-dark.png"))
@@ -165,11 +165,31 @@ pub fn run_ui_smoke() {
 }
 
 /// 功能：推进模拟时钟直至标签动画结束，再捕获稳定帧；时间：2026-11-10；作者：lq。
-fn settle(cx: &mut HeadlessAppContext, handle: AnyWindowHandle) {
+fn settle(cx: &mut HeadlessAppContext, handle: AnyWindowHandle, view: &Entity<Workbench>) {
+    // 功能：偏好持久化已异步化，等待真实保存完成后再断言主题；时间：2026-11-11；作者：lq。
+    let start = std::time::Instant::now();
+    loop {
+        cx.run_until_parked();
+        let pending = cx.update(|cx| {
+            let state = view.read(cx);
+            state.loading || !state.settings.ready || state.settings.saving
+        });
+        if !pending {
+            break;
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "workbench preferences/load timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     for _ in 0..4 {
         cx.advance_clock(std::time::Duration::from_millis(100));
         cx.run_until_parked();
-        cx.update_window(handle, |_, window, cx| window.render_frame(cx))
-            .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            window.simulate_next_frame(cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
     }
 }

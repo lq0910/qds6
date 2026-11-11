@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+// 功能：终端主题模型由偏好、状态机与原生预览共用；时间：2026-11-11；作者：lq。
+mod terminal_theme;
+pub use terminal_theme::{TerminalPalette, TerminalTheme};
+
 /// 功能：首版支持的协议及各自默认端口；时间：2026-11-10；作者：lq。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -43,6 +47,33 @@ impl Protocol {
 #[serde(transparent)]
 pub struct CredentialRef(pub Uuid);
 
+/// 功能：SSH 非秘密选项，旧版配置通过默认值迁移；时间：2026-11-10；作者：lq。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct SshOptions {
+    pub private_key: String,
+    pub use_agent: bool,
+    pub jump_profile: Option<Uuid>,
+}
+
+/// 功能：数据库证书验证策略，默认严格验证；时间：2026-11-10；作者：lq。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsMode {
+    #[default]
+    VerifyFull,
+    Disabled,
+}
+
+/// 功能：数据库 TLS 和单跳隧道引用；时间：2026-11-10；作者：lq。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct DatabaseOptions {
+    pub tls: TlsMode,
+    pub ca_file: String,
+    pub tunnel_profile: Option<Uuid>,
+}
+
 /// 功能：可持久化的非秘密连接配置，生产标记由用户明确选择；时间：2026-11-10；作者：lq。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,6 +89,10 @@ pub struct ConnectionProfile {
     pub favorite: bool,
     pub production: bool,
     pub credential: Option<CredentialRef>,
+    #[serde(default)]
+    pub ssh: SshOptions,
+    #[serde(default)]
+    pub db: DatabaseOptions,
 }
 
 /// 功能：对无效配置提供可显示错误，不回显秘密；时间：2026-11-10；作者：lq。
@@ -88,6 +123,8 @@ impl ConnectionProfile {
             favorite: false,
             production: false,
             credential: None,
+            ssh: SshOptions::default(),
+            db: DatabaseOptions::default(),
         }
     }
 
@@ -100,6 +137,7 @@ impl ConnectionProfile {
             return Err(ProfileError::InvalidName);
         }
         if self.host.trim().is_empty()
+            || self.host.starts_with('-')
             || self.host.len() > 253
             || self
                 .host
@@ -114,6 +152,14 @@ impl ConnectionProfile {
         if [&self.group, &self.username, &self.database]
             .iter()
             .any(|s| s.chars().count() > 256 || s.chars().any(char::is_control))
+        {
+            return Err(ProfileError::InvalidField);
+        }
+        if [&self.ssh.private_key, &self.db.ca_file]
+            .iter()
+            .any(|path| path.len() > 4096 || path.chars().any(char::is_control))
+            || self.ssh.jump_profile == Some(self.id)
+            || self.db.tunnel_profile == Some(self.id)
         {
             return Err(ProfileError::InvalidField);
         }

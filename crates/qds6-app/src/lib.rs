@@ -6,6 +6,7 @@ use gpui_kit::{
     component::{
         ActiveTheme, Disableable, Icon, Selectable, Sizable, StyledExt, Theme, ThemeMode, TitleBar,
         button::{Button, ButtonVariants},
+        checkbox::Checkbox,
         h_flex,
         input::{Editor, EditorState, Input, InputEvent, InputState},
         tab::{Tab, TabBar},
@@ -19,6 +20,17 @@ use std::path::PathBuf;
 
 // 功能：接入统一品牌与 Lucide 图标资源；时间：2026-11-10；作者：lq。
 mod assets;
+// 功能：真实服务工作区与终端原生绘制；时间：2026-11-10；作者：lq。
+mod services_ui;
+mod terminal_view;
+// 功能：服务器终端和双栏文件同屏，状态按服务器标签隔离；时间：2026-11-11；作者：lq。
+mod server_ui;
+// 功能：统一工作标签、页面层级与任务入口；时间：2026-11-11；作者：lq。
+mod workspace_ui;
+// 功能：软件偏好、版本检查和关于介绍；时间：2026-11-11；作者：lq。
+mod settings_ui;
+// 功能：连接文件夹分组与归组交互；时间：2026-11-11；作者：lq。
+mod connection_groups;
 use assets::{AppAssets, BRAND_IMAGE, BRAND_MARK, UiIcon};
 
 /// 功能：协议统一使用语义图标，不依赖平台字体中的特殊字符；时间：2026-11-10；作者：lq。
@@ -44,7 +56,7 @@ gpui_kit::actions!(
 );
 
 /// 功能：会话内初始 SQL，不连接或执行数据库；时间：2026-11-10；作者：lq。
-const INITIAL_SQL: &str = "-- SQL 草稿 · 仅保留在本次会话\n-- 功能：本地编辑示例；时间：2026-11-10；作者：lq。\n-- 数据库尚未连接，此处不会执行查询。\n\nSELECT\n    CURRENT_TIMESTAMP AS current_time;\n";
+const INITIAL_SQL: &str = "-- SQL 草稿 · 仅保留在本次会话\n-- 功能：查询当前时间示例；时间：2026-11-10；作者：lq。\n-- 先连接数据库，再点击执行；选区存在时仅执行选区。\n\nSELECT\n    CURRENT_TIMESTAMP AS current_time;\n";
 
 /// 功能：连接表单状态，与磁盘持久化结果分离；时间：2026-11-10；作者：lq。
 struct ProfileForm {
@@ -55,6 +67,10 @@ struct ProfileForm {
     port: Entity<InputState>,
     username: Entity<InputState>,
     database: Entity<InputState>,
+    secret: Entity<InputState>,
+    private_key: Entity<InputState>,
+    ca_file: Entity<InputState>,
+    tunnel: Entity<InputState>,
 }
 
 impl ProfileForm {
@@ -87,6 +103,33 @@ impl ProfileForm {
                     .placeholder("可选")
                     .default_value(profile.database.clone())
             }),
+            secret: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("密码 / 私钥口令；留空使用已保存凭据")
+                    .masked(true)
+            }),
+            private_key: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("私钥文件绝对路径；留空使用密码")
+                    .default_value(profile.ssh.private_key.clone())
+            }),
+            ca_file: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("可选 CA PEM 路径")
+                    .default_value(profile.db.ca_file.clone())
+            }),
+            tunnel: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("已保存 SSH 连接名；留空直连")
+                    .default_value(
+                        profile
+                            .db
+                            .tunnel_profile
+                            .or(profile.ssh.jump_profile)
+                            .map(|id| id.to_string())
+                            .unwrap_or_default(),
+                    )
+            }),
             profile,
         }
     }
@@ -96,9 +139,15 @@ impl ProfileForm {
         let mut profile = self.profile.clone();
         profile.name = self.name.read(cx).value().trim().into();
         profile.group = self.group.read(cx).value().trim().into();
+        // 功能：手工输入系统分组名与选择“未分组”保持一致；时间：2026-11-11；作者：lq。
+        if profile.group == "未分组" {
+            profile.group.clear();
+        }
         profile.host = self.host.read(cx).value().trim().into();
         profile.username = self.username.read(cx).value().trim().into();
         profile.database = self.database.read(cx).value().trim().into();
+        profile.ssh.private_key = self.private_key.read(cx).value().trim().into();
+        profile.db.ca_file = self.ca_file.read(cx).value().trim().into();
         profile.port = self
             .port
             .read(cx)
@@ -114,10 +163,22 @@ impl ProfileForm {
 /// 功能：顶层工作区；任务和订阅跟随视图销毁，不自动联网；时间：2026-11-10；作者：lq。
 struct Workbench {
     profiles: Vec<ConnectionProfile>,
+    // 功能：分组任务独立管理，避免取消保存或服务任务；时间：2026-11-11；作者：lq。
+    groups: connection_groups::GroupUi,
     form: ProfileForm,
     search: Entity<InputState>,
     sql: Entity<EditorState>,
     tab: usize,
+    // 功能：服务器和数据库有独立工作区入口；时间：2026-11-11；作者：lq。
+    area: workspace_ui::WorkspaceArea,
+    // 功能：关闭工具标签保留会话内草稿，按需打开以减少常驻导航；时间：2026-11-11；作者：lq。
+    form_open: bool,
+    sql_open: bool,
+    backup_open: bool,
+    advanced_connection: bool,
+    // 功能：打开、关闭标签或窗口缩放时把当前标签滚动到可见位置；时间：2026-11-11；作者：lq。
+    workspace_scroll: ScrollHandle,
+    last_workspace_tab: Option<(workspace_ui::WorkspaceTarget, usize, Pixels)>,
     favorites_only: bool,
     loading: bool,
     saving: bool,
@@ -129,6 +190,9 @@ struct Workbench {
     subscriptions: Vec<Subscription>,
     task: Option<Task<()>>,
     storage_path: Option<PathBuf>,
+    services: services_ui::ServiceUi,
+    // 功能：设置任务独立于连接、传输和查询任务；时间：2026-11-11；作者：lq。
+    settings: settings_ui::SettingsUi,
 }
 
 impl Workbench {
@@ -163,10 +227,18 @@ impl Workbench {
         ];
         let mut this = Self {
             profiles: Vec::new(),
+            groups: connection_groups::GroupUi::default(),
             form: ProfileForm::new(ConnectionProfile::new(Protocol::Ssh), window, cx),
             search,
             sql,
             tab: 0,
+            area: workspace_ui::WorkspaceArea::Servers,
+            form_open: false,
+            sql_open: false,
+            backup_open: false,
+            advanced_connection: false,
+            workspace_scroll: ScrollHandle::new(),
+            last_workspace_tab: None,
             favorites_only: false,
             loading: false,
             saving: false,
@@ -178,9 +250,12 @@ impl Workbench {
             subscriptions,
             task: None,
             storage_path,
+            services: services_ui::ServiceUi::new(window, cx),
+            settings: settings_ui::SettingsUi::default(),
         };
         this.watch_form(cx);
         this.load(cx);
+        this.load_preferences(window, cx);
         this
     }
 
@@ -194,6 +269,10 @@ impl Workbench {
             &self.form.port,
             &self.form.username,
             &self.form.database,
+            &self.form.secret,
+            &self.form.private_key,
+            &self.form.ca_file,
+            &self.form.tunnel,
         ] {
             self.subscriptions
                 .push(cx.subscribe(input, |this, _, event: &InputEvent, cx| {
@@ -226,7 +305,7 @@ impl Workbench {
 
     /// 功能：SQLite 和文件 I/O 在后台进行，失败不伪装成空配置；时间：2026-11-10；作者：lq。
     fn load(&mut self, cx: &mut Context<Self>) {
-        if self.loading || self.saving {
+        if self.loading || self.saving || self.services.busy || self.groups.busy {
             return;
         }
         self.loading = true;
@@ -236,15 +315,16 @@ impl Workbench {
                 .background_spawn(async move {
                     let path = storage_path.map(Ok).unwrap_or_else(Self::store_path)?;
                     ProfileStore::open(path)
-                        .and_then(|store| store.list())
+                        .and_then(|store| Ok((store.list()?, store.groups()?)))
                         .map_err(|error| error.to_string())
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.loading = false;
                 match result {
-                    Ok(profiles) => {
+                    Ok((profiles, groups)) => {
                         this.profiles = profiles;
+                        this.groups.set_items(groups, cx);
                         this.ready = true;
                         this.error = false;
                         this.status = "本地配置已就绪 · 所有连接均未连接".into();
@@ -267,7 +347,18 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.saving {
+        self.open_profile_action(profile, false, window, cx);
+    }
+
+    /// 功能：双击已保存连接时先处理未保存表单，再启动当前连接；时间：2026-11-11；作者：lq。
+    fn open_profile_action(
+        &mut self,
+        profile: ConnectionProfile,
+        connect: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.saving || self.services.busy {
             return;
         }
         if self.form_dirty {
@@ -281,13 +372,19 @@ impl Workbench {
             cx.spawn_in(window, async move |this, window| {
                 if answer.await == Ok(1) {
                     let _ = this.update_in(window, |this, window, cx| {
-                        this.replace_form(profile, window, cx)
+                        this.replace_form(profile, window, cx);
+                        if connect {
+                            this.connect_service(window, cx);
+                        }
                     });
                 }
             })
             .detach();
         } else {
             self.replace_form(profile, window, cx);
+            if connect {
+                self.connect_service(window, cx);
+            }
         }
     }
 
@@ -298,10 +395,13 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.area = workspace_ui::WorkspaceArea::for_protocol(profile.protocol);
         self.form = ProfileForm::new(profile, window, cx);
         self.watch_form(cx);
         self.form_dirty = false;
         self.tab = 1;
+        self.form_open = true;
+        self.advanced_connection = false;
         self.error = false;
         self.status = "编辑连接配置 · 保存不会自动连接".into();
         cx.notify();
@@ -309,10 +409,10 @@ impl Workbench {
 
     /// 功能：事务提交后再刷新列表，失败保留表单；时间：2026-11-10；作者：lq。
     fn save(&mut self, cx: &mut Context<Self>) {
-        if !self.ready || self.saving {
+        if !self.ready || self.saving || self.services.busy || self.groups.busy {
             return;
         }
-        let profile = match self.form.collect(cx) {
+        let mut profile = match self.collect_profile(cx) {
             Ok(profile) => profile,
             Err(error) => {
                 self.status = error.into();
@@ -321,6 +421,12 @@ impl Workbench {
                 return;
             }
         };
+        // 功能：新凭据先写 Keychain，配置失败时清理；普通 SQLite 从不接收秘密；时间：2026-11-10；作者：lq。
+        let secret = zeroize::Zeroizing::new(self.form.secret.read(cx).value().to_string());
+        let previous_credential = profile.credential.clone();
+        if !secret.is_empty() {
+            profile.credential = Some(qds6_core::CredentialRef(uuid::Uuid::new_v4()));
+        }
         let storage_path = self.storage_path.clone();
         self.saving = true;
         self.status = "正在保存连接配置…".into();
@@ -330,14 +436,34 @@ impl Workbench {
                 .background_spawn(async move {
                     let path = storage_path.map(Ok).unwrap_or_else(Self::store_path)?;
                     let mut store = ProfileStore::open(path).map_err(|error| error.to_string())?;
-                    store.save(&profile).map_err(|error| error.to_string())?;
-                    Ok::<_, String>(profile)
+                    if !secret.is_empty() {
+                        qds6_services::credentials::CredentialStore::set(
+                            profile.credential.as_ref().expect("new credential"),
+                            &secret,
+                        )?;
+                    }
+                    if let Err(error) = store.save(&profile) {
+                        if !secret.is_empty() {
+                            let _ = qds6_services::credentials::CredentialStore::delete(
+                                profile.credential.as_ref().expect("new credential"),
+                            );
+                        }
+                        return Err(error.to_string());
+                    }
+                    if !secret.is_empty()
+                        && let Some(old) = previous_credential
+                    {
+                        let _ = qds6_services::credentials::CredentialStore::delete(&old);
+                    }
+                    let groups = store.groups().map_err(|error| error.to_string())?;
+                    Ok::<_, String>((profile, groups))
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.saving = false;
                 match result {
-                    Ok(profile) => {
+                    Ok((profile, groups)) => {
+                        this.groups.set_items(groups, cx);
                         if let Some(index) =
                             this.profiles.iter().position(|item| item.id == profile.id)
                         {
@@ -361,20 +487,81 @@ impl Workbench {
         cx.notify();
     }
 
+    /// 功能：删除前检查依赖并确认，后台操作 SQLite；凭据保留供本机快照回滚；时间：2026-11-11；作者：lq。
+    fn delete_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.saving || self.loading || self.services.busy || self.groups.busy {
+            return;
+        }
+        let id = self.form.profile.id;
+        if self
+            .profiles
+            .iter()
+            .any(|p| p.ssh.jump_profile == Some(id) || p.db.tunnel_profile == Some(id))
+        {
+            self.status = "此连接仍被跳板或数据库隧道引用，请先移除依赖".into();
+            cx.notify();
+            return;
+        }
+        let answer = window.prompt(PromptLevel::Warning, "删除此连接？", Some("活动会话保持连接；该连接的未保存表单修改会丢弃。Keychain 引用保留供已有本机快照回滚。"), &["取消", "删除"], cx);
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(1) {
+                return;
+            }
+            let _ = this.update_in(cx, |this, window, cx| {
+                let storage = this.storage_path.clone();
+                this.service_job(
+                    "正在删除连接…",
+                    move || {
+                        let path = storage.map(Ok).unwrap_or_else(Self::store_path)?;
+                        ProfileStore::open(path)
+                            .and_then(|mut store| store.delete(&id.to_string()))
+                            .map_err(|e| e.to_string())
+                    },
+                    move |this, _, window, cx| {
+                        this.profiles.retain(|p| p.id != id);
+                        this.replace_form(ConnectionProfile::new(Protocol::Ssh), window, cx);
+                        this.status = "连接已删除，活动会话未关闭".into();
+                    },
+                    window,
+                    cx,
+                );
+            });
+        })
+        .detach();
+    }
+
     /// 功能：菜单、快捷键和窗口关闭共用同一丢弃确认；时间：2026-11-10；作者：lq。
     fn allow_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.saving {
-            self.status = "正在保存连接，请等待保存完成再关闭".into();
+        if self.saving
+            || self.groups.busy
+            || self.services.busy
+            || self
+                .services
+                .servers
+                .iter()
+                .any(|server| server.read(cx).pending())
+        {
+            self.status = "正在保存连接或加密草稿，请等待完成再关闭".into();
             cx.notify();
             return false;
         }
-        if !self.form_dirty && !self.sql_dirty {
+        if !self.form_dirty
+            && !self.groups.editing()
+            && !self.sql_dirty
+            && !self
+                .services
+                .servers
+                .iter()
+                .any(|server| server.read(cx).services.remote_dirty)
+            && !self.services.has_live_sessions()
+            && !self.services.busy
+        {
             return true;
         }
         let answer = window.prompt(
             PromptLevel::Warning,
             "关闭 QDS6？",
-            Some("未保存的连接修改和会话内 SQL 草稿将被丢弃。可取消关闭并保存连接或复制 SQL。"),
+            Some("活动会话将断开；未保存的连接、分组名称、SQL 和远程文件草稿将被丢弃。请先保存或复制需要保留的内容。"),
             &["取消", "丢弃并关闭"],
             cx,
         );
@@ -388,102 +575,26 @@ impl Workbench {
         false
     }
 
-    /// 功能：统一字段样式和可访问名称，保存时冻结输入；时间：2026-11-10；作者：lq。
+    /// 功能：统一紧凑字段、可访问名称与保存中禁用状态；时间：2026-11-11；作者：lq。
     fn field(&self, label: &'static str, input: &Entity<InputState>) -> impl IntoElement + use<> {
         v_flex()
             .flex_1()
             .min_w_0()
-            .gap_2()
-            .child(div().text_sm().child(label))
+            .gap_1()
+            .child(div().text_xs().child(label))
             .child(
                 Input::new(input)
                     .id(label)
                     .aria_label(label)
-                    .disabled(self.saving),
+                    .disabled(self.saving || self.services.busy),
             )
     }
 
-    /// 功能：本地搜索、收藏筛选和连接分组侧栏；时间：2026-11-10；作者：lq。
+    /// 功能：本地搜索、收藏筛选和文件夹分组侧栏；时间：2026-11-11；作者：lq。
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let query = self.search.read(cx).value();
-        let mut profiles: Vec<_> = self
-            .profiles
-            .iter()
-            .filter(|p| p.matches(&query) && (!self.favorites_only || p.favorite))
-            .cloned()
-            .collect();
-        profiles.sort_by(|a, b| a.group.cmp(&b.group).then(a.name.cmp(&b.name)));
-        let mut list = v_flex().gap_1();
-        let mut group: Option<String> = None;
-        for profile in &profiles {
-            if group.as_ref() != Some(&profile.group) {
-                group = Some(profile.group.clone());
-                list = list.child(
-                    div()
-                        .px_2()
-                        .pt_4()
-                        .pb_2()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(if profile.group.is_empty() {
-                            "未分组".into()
-                        } else {
-                            profile.group.clone()
-                        }),
-                );
-            }
-            let selected = self.form.profile.id == profile.id && self.tab == 1;
-            let profile = profile.clone();
-            // 功能：连接类型和收藏标记统一绘制为 SVG，保留连接名称原文；时间：2026-11-10；作者：lq。
-            let heading = h_flex()
-                .gap_2()
-                .items_center()
-                .child(Icon::new(protocol_icon(profile.protocol)).small())
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_sm()
-                        .child(profile.name.clone()),
-                )
-                .when(profile.favorite, |row| {
-                    row.child(Icon::new(UiIcon::Star).xsmall())
-                });
-            let detail = format!(
-                "{} · {}:{}{}",
-                profile.protocol.label(),
-                profile.host,
-                profile.port,
-                if profile.production { " · 生产" } else { "" }
-            );
-            list = list.child(
-                div()
-                    .id(SharedString::from(profile.id.to_string()))
-                    .test_support()
-                    .px_2()
-                    .py_2()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .bg(if selected {
-                        cx.theme().secondary
-                    } else {
-                        cx.theme().sidebar
-                    })
-                    .hover(|style| style.bg(cx.theme().secondary))
-                    .child(heading)
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(detail),
-                    )
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_profile(profile.clone(), window, cx)
-                    })),
-            );
-        }
+        let list = self.connection_group_list(cx);
         v_flex()
-            .w(px(264.))
+            .w(px(224.))
             .h_full()
             .flex_shrink_0()
             .border_r_1()
@@ -497,17 +608,17 @@ impl Workbench {
                         h_flex()
                             .justify_between()
                             .items_center()
-                            .child(div().font_semibold().child("连接"))
+                            .child(div().font_semibold().child(self.area.label()))
                             .child(
                                 Button::new("new-sidebar")
                                     .ghost()
                                     .small()
                                     .icon(UiIcon::Plus)
                                     .label("新建")
-                                    .disabled(self.saving)
+                                    .disabled(self.saving || self.groups.busy)
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.open_profile(
-                                            ConnectionProfile::new(Protocol::Ssh),
+                                            ConnectionProfile::new(this.area.default_protocol()),
                                             window,
                                             cx,
                                         )
@@ -537,6 +648,15 @@ impl Workbench {
                             })),
                     ),
             )
+            .child(self.group_toolbar(cx))
+            .child(
+                div()
+                    .px_4()
+                    .pb_2()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("双击连接 · 拖动连接可归组"),
+            )
             .child(
                 div()
                     .id("connections-scroll")
@@ -544,260 +664,507 @@ impl Workbench {
                     .min_h_0()
                     .overflow_y_scroll()
                     .px_2()
-                    .child(list)
-                    .when(profiles.is_empty(), |element| {
-                        element.child(
-                            div()
-                                .px_2()
-                                .py_6()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(if self.loading {
-                                    "正在读取…"
-                                } else if !self.ready {
-                                    "配置读取失败，请重试"
-                                } else if self.profiles.is_empty() {
-                                    "还没有连接。新建一个开始。"
-                                } else {
-                                    "没有匹配的连接"
-                                }),
-                        )
-                    }),
+                    .child(list),
             )
             .child(
-                div()
-                    .p_4()
+                v_flex()
+                    .p_3()
+                    .gap_1()
                     .border_t_1()
                     .border_color(cx.theme().border)
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(format!("{} 个已保存连接 · 本机", self.profiles.len())),
-            )
-    }
-
-    /// 功能：显示当前可用操作及未接入的网络能力；时间：2026-11-10；作者：lq。
-    fn welcome(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        v_flex()
-            .size_full()
-            .justify_center()
-            .px_12()
-            .gap_5()
-            // 功能：彩色品牌使用图像管线，保留原始渐变和透明边距；时间：2026-11-10；作者：lq。
-            .child(img(BRAND_IMAGE).size(px(88.)))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("本地工作区 / QDS6 0.1.0"),
-            )
-            .child(div().text_3xl().font_semibold().child("连接，从此简单。"))
-            .child(
-                div()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("终端、文件与数据库，一个工作台。"),
-            )
-            .child(
-                h_flex()
-                    .gap_3()
+                    .when(self.area == workspace_ui::WorkspaceArea::Databases, |v| {
+                        v.child(
+                            h_flex().child(
+                                Button::new("open-sql-sidebar")
+                                    .ghost()
+                                    .small()
+                                    .justify_start()
+                                    .icon(UiIcon::FileCode)
+                                    .label("SQL 草稿")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.activate_workspace(
+                                            workspace_ui::WorkspaceTarget::Sql,
+                                            cx,
+                                        )
+                                    })),
+                            ),
+                        )
+                    })
                     .child(
-                        Button::new("new-welcome")
-                            .primary()
-                            .icon(UiIcon::Plus)
-                            .label("新建连接")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_profile(ConnectionProfile::new(Protocol::Ssh), window, cx)
-                            })),
+                        h_flex().child(
+                            Button::new("open-backup-sidebar")
+                                .ghost()
+                                .small()
+                                .justify_start()
+                                .icon(UiIcon::Download)
+                                .label("导入与备份")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.activate_workspace(
+                                        workspace_ui::WorkspaceTarget::Backup,
+                                        cx,
+                                    )
+                                })),
+                        ),
                     )
                     .child(
-                        Button::new("open-sql")
-                            .icon(UiIcon::FileCode)
-                            .label("打开 SQL 草稿")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.tab = 2;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .mt_6()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(
-                        "当前可管理本地连接配置、编辑 SQL 草稿。SSH、SFTP 和数据库连接正在开发。",
+                        div()
+                            .px_2()
+                            .pt_2()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("{} 个连接 · 本机存储", self.profiles.len())),
                     ),
             )
     }
 
-    /// 功能：非秘密连接编辑页，不接受密码输入；时间：2026-11-10；作者：lq。
-    fn connection_page(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let mut protocols = h_flex().gap_2();
-        for protocol in Protocol::ALL {
-            protocols = protocols.child(
-                Button::new(protocol.label())
-                    .small()
-                    .icon(protocol_icon(protocol))
-                    .label(protocol.label())
-                    .selected(self.form.profile.protocol == protocol)
-                    .disabled(self.saving)
+    /// 功能：工作区起始页围绕三种连接任务组织入口；时间：2026-11-11；作者：lq。
+    fn welcome(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let mut actions = v_flex().gap_1();
+        let entries = match self.area {
+            workspace_ui::WorkspaceArea::Servers => vec![(
+                Protocol::Ssh,
+                "SSH + SFTP 服务器",
+                "一个连接，同时使用终端、本地与远程文件",
+            )],
+            workspace_ui::WorkspaceArea::Databases => vec![
+                (
+                    Protocol::MySql,
+                    "MySQL",
+                    "浏览数据库对象、编写 SQL 与查看结果",
+                ),
+                (
+                    Protocol::PostgreSql,
+                    "PostgreSQL",
+                    "浏览数据库对象、编写 SQL 与查看结果",
+                ),
+            ],
+        };
+        for (protocol, title, description) in entries {
+            actions = actions.child(
+                h_flex()
+                    .id(protocol.label())
+                    .test_support()
+                    .w_full()
+                    .p_3()
+                    .gap_3()
+                    .items_center()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(cx.theme().secondary))
+                    .child(Icon::new(protocol_icon(protocol)).small())
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .gap_1()
+                            .child(div().text_sm().font_semibold().child(title))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(description),
+                            ),
+                    )
+                    .child(
+                        Icon::new(UiIcon::ChevronRight)
+                            .small()
+                            .text_color(cx.theme().muted_foreground),
+                    )
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        if this.form.profile.protocol == protocol {
-                            return;
-                        }
-                        this.form.profile.protocol = protocol;
-                        this.form.port.update(cx, |state, cx| {
-                            state.set_value(protocol.default_port().to_string(), window, cx)
-                        });
-                        this.form_dirty = true;
-                        cx.notify();
+                        this.open_profile(ConnectionProfile::new(protocol), window, cx)
                     })),
             );
         }
         div()
-            .id("form-scroll")
-            .flex_1()
-            .min_h_0()
+            .id("welcome-scroll")
+            .size_full()
             .overflow_y_scroll()
             .child(
                 v_flex()
+                    .w_full()
+                    .min_h_full()
+                    .items_center()
+                    .justify_center()
                     .p_8()
-                    .gap_5()
-                    .max_w(px(840.))
                     .child(
-                        h_flex()
-                            .justify_between()
-                            .items_center()
-                            .child(div().text_xl().font_semibold().child(
-                                if self.profiles.iter().any(|p| p.id == self.form.profile.id) {
-                                    "编辑连接"
-                                } else {
-                                    "新建连接"
-                                },
+                        v_flex()
+                            .w_full()
+                            .max_w(px(520.))
+                            .gap_5()
+                            .child(
+                                h_flex()
+                                    .gap_3()
+                                    .items_center()
+                                    .child(img(BRAND_IMAGE).size(px(44.)))
+                                    .child(
+                                        v_flex()
+                                            .gap_1()
+                                            .child(div().text_2xl().font_semibold().child("QDS6"))
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(
+                                                        if self.area
+                                                            == workspace_ui::WorkspaceArea::Servers
+                                                        {
+                                                            "服务器工作区 · 终端与文件同屏"
+                                                        } else {
+                                                            "数据库工作区 · 对象、查询与结果"
+                                                        },
+                                                    ),
+                                            ),
+                                    ),
+                            )
+                            .child(Self::section_heading(
+                                "开始连接",
+                                "选择连接类型，或从左侧打开已保存的连接。",
+                                cx,
                             ))
+                            .child(actions)
                             .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("未连接"),
-                            ),
-                    )
-                    .child(protocols)
-                    .child(
-                        h_flex()
-                            .gap_4()
-                            .child(self.field("连接名称", &self.form.name))
-                            .child(self.field("分组", &self.form.group)),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_4()
-                            .child(self.field("主机", &self.form.host))
-                            .child(self.field("端口", &self.form.port)),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_4()
-                            .child(self.field("用户名", &self.form.username))
-                            .child(self.field("数据库（MySQL / PostgreSQL）", &self.form.database)),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_3()
-                            .child(
-                                Button::new("favorite")
-                                    .ghost()
-                                    .small()
-                                    .icon(UiIcon::Star)
-                                    .label(if self.form.profile.favorite {
-                                        "已收藏"
-                                    } else {
-                                        "收藏"
-                                    })
-                                    .disabled(self.saving)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.form.profile.favorite = !this.form.profile.favorite;
-                                        this.form_dirty = true;
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                Button::new("production")
-                                    .ghost()
-                                    .small()
-                                    .label(if self.form.profile.production {
-                                        "● 生产环境"
-                                    } else {
-                                        "○ 非生产环境"
-                                    })
-                                    .disabled(self.saving)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.form.profile.production =
-                                            !this.form.profile.production;
-                                        this.form_dirty = true;
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .border_t_1()
-                            .border_color(cx.theme().border)
-                            .pt_5()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("此处保存地址和用户名。认证与连接功能尚未接入。"),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_3()
-                            .items_center()
-                            .child(
-                                Button::new("save-profile")
-                                    .primary()
-                                    .icon(UiIcon::Save)
-                                    .label(if self.saving {
-                                        "保存中…"
-                                    } else {
-                                        "保存连接"
-                                    })
-                                    .disabled(!self.ready || self.loading || self.saving)
-                                    .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(if self.form_dirty {
-                                        "有未保存的修改"
-                                    } else {
-                                        "保存后仍保持断开"
-                                    }),
+                                h_flex()
+                                    .pt_4()
+                                    .gap_3()
+                                    .flex_wrap()
+                                    .border_t_1()
+                                    .border_color(cx.theme().border)
+                                    .child(
+                                        Button::new("new-welcome")
+                                            .primary()
+                                            .small()
+                                            .icon(UiIcon::Plus)
+                                            .label("新建连接")
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.open_profile(
+                                                    ConnectionProfile::new(
+                                                        this.area.default_protocol(),
+                                                    ),
+                                                    window,
+                                                    cx,
+                                                )
+                                            })),
+                                    )
+                                    .when(
+                                        self.area == workspace_ui::WorkspaceArea::Databases,
+                                        |v| {
+                                            v.child(
+                                                Button::new("open-sql")
+                                                    .ghost()
+                                                    .small()
+                                                    .icon(UiIcon::FileCode)
+                                                    .label("SQL 草稿")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.activate_workspace(
+                                                            workspace_ui::WorkspaceTarget::Sql,
+                                                            cx,
+                                                        )
+                                                    })),
+                                            )
+                                        },
+                                    ),
                             ),
                     ),
             )
     }
 
-    /// 功能：Kit SQL 编辑器与复制出口；不提供虚假的查询执行；时间：2026-11-10；作者：lq。
-    fn sql_page(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    /// 功能：按基础、地址、认证分节，固定操作栏始终可达；时间：2026-11-11；作者：lq。
+    fn connection_page(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let protocol = self.form.profile.protocol;
+        let database = matches!(protocol, Protocol::MySql | Protocol::PostgreSql);
+        let existing = self.profiles.iter().any(|p| p.id == self.form.profile.id);
+        // 功能：服务器配置只显示 SSH/SFTP，数据库只显示数据库协议；时间：2026-11-11；作者：lq。
+        let kinds = if database {
+            [Protocol::MySql, Protocol::PostgreSql]
+        } else {
+            [Protocol::Ssh, Protocol::Sftp]
+        };
+        let protocols = TabBar::new("connection-protocols")
+            .segmented()
+            .selected_index(kinds.iter().position(|p| *p == protocol).unwrap_or(0))
+            .children(kinds.into_iter().map(|kind| {
+                Tab::new()
+                    .prefix(Icon::new(protocol_icon(kind)).small())
+                    .label(match kind {
+                        Protocol::Ssh => "SSH + SFTP",
+                        Protocol::Sftp => "仅 SFTP",
+                        _ => kind.label(),
+                    })
+                    .disabled(self.saving || self.services.busy)
+            }))
+            .on_click(cx.listener(move |this, index: &usize, window, cx| {
+                let kind = kinds[*index];
+                if this.form.profile.protocol != kind {
+                    this.form.profile.protocol = kind;
+                    this.form.port.update(cx, |state, cx| {
+                        state.set_value(kind.default_port().to_string(), window, cx)
+                    });
+                    this.form_dirty = true;
+                    cx.notify();
+                }
+            }));
         v_flex()
             .size_full()
             .child(
+                div()
+                    .id("form-scroll")
+                    .test_support()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .max_w(px(820.))
+                            .p_6()
+                            .gap_3()
+                            .child(
+                                v_flex()
+                                    .gap_2()
+                                    .child(div().text_xl().font_semibold().child(if existing {
+                                        "编辑连接"
+                                    } else {
+                                        "新建连接"
+                                    }))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child("配置连接信息，保存后可从左侧随时打开。"),
+                                    ),
+                            )
+                            .child(h_flex().child(protocols))
+                            .child(
+                                v_flex()
+                                    .gap_3()
+                                    .child(Self::section_heading("基本信息", "", cx))
+                                    .child(
+                                        h_flex()
+                                            .gap_3()
+                                            .child(self.field("连接名称", &self.form.name))
+                                            .child(self.group_form_field(cx)),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_3()
+                                            .items_center()
+                                            .flex_wrap()
+                                            .child(
+                                                Checkbox::new("favorite")
+                                                    .label("收藏连接")
+                                                    .checked(self.form.profile.favorite)
+                                                    .disabled(self.saving || self.services.busy)
+                                                    .on_click(cx.listener(
+                                                        |this, checked: &bool, _, cx| {
+                                                            this.form.profile.favorite = *checked;
+                                                            this.form_dirty = true;
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                Checkbox::new("production")
+                                                    .label("生产环境")
+                                                    .checked(self.form.profile.production)
+                                                    .disabled(self.saving || self.services.busy)
+                                                    .on_click(cx.listener(
+                                                        |this, checked: &bool, _, cx| {
+                                                            this.form.profile.production = *checked;
+                                                            this.form_dirty = true;
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_3()
+                                    .pt_4()
+                                    .border_t_1()
+                                    .border_color(cx.theme().border)
+                                    .child(Self::section_heading("连接地址", "", cx))
+                                    .child(
+                                        h_flex()
+                                            .gap_3()
+                                            .child(self.field("主机", &self.form.host))
+                                            .child(
+                                                div()
+                                                    .w(px(120.))
+                                                    .child(self.field("端口", &self.form.port)),
+                                            ),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .gap_3()
+                                            .child(self.field("用户名", &self.form.username))
+                                            .when(database, |row| {
+                                                row.child(self.field("数据库", &self.form.database))
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_3()
+                                    .pt_4()
+                                    .border_t_1()
+                                    .border_color(cx.theme().border)
+                                    .child(Self::section_heading(
+                                        "身份验证",
+                                        "密码保存在 macOS Keychain；留空使用已保存凭据。",
+                                        cx,
+                                    ))
+                                    .child(self.authentication_fields(cx)),
+                            )
+                            .child(
+                                v_flex()
+                                    .gap_3()
+                                    .pt_4()
+                                    .border_t_1()
+                                    .border_color(cx.theme().border)
+                                    .child(
+                                        Button::new("toggle-connection-advanced")
+                                            .ghost()
+                                            .small()
+                                            .justify_start()
+                                            .icon(if self.advanced_connection {
+                                                UiIcon::ChevronDown
+                                            } else {
+                                                UiIcon::ChevronRight
+                                            })
+                                            .label(if database {
+                                                "高级选项 · SSH 隧道与 TLS"
+                                            } else {
+                                                "高级选项 · 跳板连接"
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.advanced_connection =
+                                                    !this.advanced_connection;
+                                                cx.notify();
+                                            })),
+                                    )
+                                    .when(self.advanced_connection, |v| {
+                                        v.child(self.advanced_authentication_fields(cx))
+                                    }),
+                            ),
+                    ),
+            )
+            .child(
                 h_flex()
-                    .h_12()
-                    .px_4()
+                    .id("connection-actions")
+                    .test_support()
+                    .flex_shrink_0()
+                    .min_h(px(64.))
+                    .px_6()
+                    .py_3()
                     .gap_3()
                     .items_center()
-                    .justify_between()
+                    .flex_wrap()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().background)
+                    .child(
+                        Button::new("connect-profile")
+                            .primary()
+                            .icon(UiIcon::Plug)
+                            .label(if self.services.busy {
+                                "连接中…"
+                            } else {
+                                "连接"
+                            })
+                            .disabled(self.services.busy || self.saving)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.connect_service(window, cx)),
+                            ),
+                    )
+                    .child(
+                        Button::new("save-profile")
+                            .icon(UiIcon::Save)
+                            .label(if self.saving {
+                                "保存中…"
+                            } else {
+                                "保存连接"
+                            })
+                            .disabled(
+                                !self.ready || self.loading || self.saving || self.services.busy,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(if self.form_dirty {
+                                "有未保存的修改"
+                            } else {
+                                "保存不会自动连接"
+                            }),
+                    )
+                    .when(existing, |v| {
+                        v.child(
+                            Button::new("delete-profile")
+                                .ghost()
+                                .small()
+                                .icon(UiIcon::Trash)
+                                .label("删除…")
+                                .disabled(self.services.busy || self.saving)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.delete_profile(window, cx)
+                                })),
+                        )
+                    }),
+            )
+    }
+
+    /// 功能：SQL 操作集中于右侧，编辑器与查询结果留在同一页面；时间：2026-11-11；作者：lq。
+    fn sql_page(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let connected = self.services.database.is_some();
+        v_flex()
+            .size_full()
+            .min_h_0()
+            .child(
+                h_flex()
+                    .min_h(px(46.))
+                    .flex_shrink_0()
+                    .px_4()
+                    .py_2()
+                    .gap_2()
+                    .items_center()
+                    .flex_wrap()
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .child(
                         div()
-                            .text_sm()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child("SQL 草稿 · 仅本次会话 · 未连接数据库"),
+                            .text_ellipsis()
+                            .child(if connected {
+                                format!("{} · 选区优先执行", self.services.database_identity)
+                            } else {
+                                "SQL 草稿 · 尚未连接数据库".into()
+                            }),
                     )
+                    .when(!connected, |v| {
+                        v.child(
+                            Button::new("sql-connect-database")
+                                .small()
+                                .ghost()
+                                .label("连接数据库…")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_profile(
+                                        ConnectionProfile::new(Protocol::PostgreSql),
+                                        window,
+                                        cx,
+                                    )
+                                })),
+                        )
+                    })
                     .child(
                         Button::new("copy-sql")
+                            .ghost()
                             .small()
                             .icon(UiIcon::Copy)
                             .label("复制 SQL")
@@ -818,6 +1185,25 @@ impl Workbench {
                                 }
                                 cx.notify();
                             })),
+                    )
+                    .when(self.services.busy && connected, |v| {
+                        v.child(
+                            Button::new("cancel-query")
+                                .small()
+                                .label("取消查询")
+                                .on_click(cx.listener(|this, _, _, cx| this.cancel_query(cx))),
+                        )
+                    })
+                    .child(
+                        Button::new("run-sql")
+                            .small()
+                            .primary()
+                            .icon(UiIcon::Play)
+                            .label("执行 SQL")
+                            .disabled(self.services.busy || !connected)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.execute_sql(None, window, cx)
+                            })),
                     ),
             )
             .child(
@@ -828,20 +1214,35 @@ impl Workbench {
                         .aria_label("SQL 草稿编辑器"),
                 ),
             )
+            .when(self.has_query_results(), |v| {
+                v.child(
+                    div()
+                        .id("sql-results")
+                        .flex_1()
+                        .min_h_0()
+                        .border_t_1()
+                        .border_color(cx.theme().border)
+                        .child(self.query_results_panel(cx)),
+                )
+            })
     }
 }
 
 /// 功能：统一主题的标题栏、侧栏、Kit 标签和状态栏；时间：2026-11-10；作者：lq。
 impl Render for Workbench {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let page = match self.tab {
             1 => self.connection_page(cx).into_any_element(),
             2 => self.sql_page(cx).into_any_element(),
+            3 => self.services_page(window, cx).into_any_element(),
+            4 => self.backup_page(cx).into_any_element(),
+            5 => self.settings_page(cx).into_any_element(),
             _ => self.welcome(cx).into_any_element(),
         };
         v_flex()
             .size_full()
             .bg(cx.theme().background)
+            .text_sm()
             .text_color(cx.theme().foreground)
             .child(
                 TitleBar::new().child(
@@ -877,60 +1278,41 @@ impl Render for Workbench {
                                 } else {
                                     "深色"
                                 })
-                                .on_click(|_, window, cx| {
-                                    let mode = if cx.theme().mode.is_dark() {
-                                        ThemeMode::Light
+                                .disabled(!self.settings.ready || self.settings.saving)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    let mut preferences = this.settings.preferences.clone();
+                                    preferences.theme = if cx.theme().mode.is_dark() {
+                                        qds6_storage::ColorTheme::Light
                                     } else {
-                                        ThemeMode::Dark
+                                        qds6_storage::ColorTheme::Dark
                                     };
-                                    Theme::change(mode, Some(window), cx);
-                                }),
+                                    this.save_preferences(preferences, window, cx);
+                                })),
                         ),
                 ),
             )
             .child(
-                h_flex().flex_1().min_h_0().child(self.sidebar(cx)).child(
-                    v_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .h_full()
-                        .child(
-                            TabBar::new("workspace-tabs")
-                                .underline()
-                                .selected_index(self.tab)
-                                // 功能：Kit 的 icon 槽为纯图标模式，使用 prefix 保留标签文字；时间：2026-11-10；作者：lq。
-                                .child(
-                                    Tab::new()
-                                        .prefix(Icon::new(UiIcon::PanelLeft).small())
-                                        .label("工作区"),
-                                )
-                                .child(Tab::new().prefix(Icon::new(UiIcon::Server).small()).label(
-                                    if self.form_dirty {
-                                        "连接配置 •"
-                                    } else {
-                                        "连接配置"
-                                    },
-                                ))
-                                .child(
-                                    Tab::new()
-                                        .prefix(Icon::new(UiIcon::FileCode).small())
-                                        .label(if self.sql_dirty {
-                                            "SQL 草稿 •"
-                                        } else {
-                                            "SQL 草稿"
-                                        }),
-                                )
-                                .on_click(cx.listener(|this, index: &usize, _, cx| {
-                                    this.tab = *index;
-                                    cx.notify();
-                                })),
-                        )
-                        .child(page),
-                ),
+                h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(self.navigation_rail(cx))
+                    .when(self.tab != 5, |row| row.child(self.sidebar(cx)))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(self.workspace_tabs(window, cx))
+                            .child(div().flex_1().min_h_0().overflow_hidden().child(page)),
+                    ),
             )
             .child(
                 h_flex()
-                    .min_h(px(30.))
+                    .id("workspace-status")
+                    .test_support()
+                    .h(px(28.))
+                    .flex_shrink_0()
                     .px_3()
                     .gap_3()
                     .items_center()
@@ -943,13 +1325,19 @@ impl Render for Workbench {
                     } else {
                         cx.theme().muted_foreground
                     })
-                    .child(self.status.clone())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_ellipsis()
+                            .child(self.status.clone()),
+                    )
                     .child(
                         Button::new("reload")
                             .ghost()
                             .xsmall()
                             .icon(UiIcon::RefreshCw)
-                            .label("重新读取")
+                            .tooltip("重新读取连接配置")
                             .disabled(self.loading || self.saving)
                             .on_click(cx.listener(|this, _, _, cx| this.load(cx))),
                     ),
@@ -1022,21 +1410,40 @@ pub fn run() {
                 if let Some(window) = cx.active_window() {
                     let _ = window.update(cx, |_, window, cx| {
                         let _ = weak.update(cx, |state, cx| {
-                            state.open_profile(ConnectionProfile::new(Protocol::Ssh), window, cx)
+                            state.open_profile(
+                                ConnectionProfile::new(state.area.default_protocol()),
+                                window,
+                                cx,
+                            )
                         });
                     });
                 }
             });
             let weak = view.downgrade();
+            // 功能：保存快捷键按当前工作区路由，远程编辑器不会误保存连接表单；时间：2026-11-11；作者：lq。
             cx.on_action(move |_: &SaveConnection, cx| {
-                let _ = weak.update(cx, |state, cx| {
-                    if state.tab == 1 {
-                        state.save(cx);
-                    } else {
-                        state.status = "SQL 草稿仅保留本次会话，请使用「复制 SQL」另行保存".into();
-                        cx.notify();
-                    }
-                });
+                if let Some(window) = cx.active_window() {
+                    let _ = window.update(cx, |_, window, cx| {
+                        let _ = weak.update(cx, |state, cx| {
+                            if state.tab == 1 {
+                                state.save(cx);
+                            } else if state.tab == 3 && state.services.page != 3 {
+                                if let Some(server) = state
+                                    .services
+                                    .servers
+                                    .get(state.services.active_server)
+                                    .cloned()
+                                {
+                                    server.update(cx, |server, cx| server.save_remote(window, cx));
+                                }
+                            } else {
+                                state.status =
+                                    "SQL 草稿仅保留本次会话，请使用「复制 SQL」另行保存".into();
+                                cx.notify();
+                            }
+                        });
+                    });
+                }
             });
             view
         }) {
@@ -1051,7 +1458,15 @@ pub fn run() {
 #[cfg(feature = "ui-tests")]
 mod smoke;
 #[cfg(feature = "ui-tests")]
+pub use services_ui::run_service_ui_smoke;
+#[cfg(feature = "ui-tests")]
 pub use smoke::run_ui_smoke;
+// 功能：独立布局回归覆盖最小窗口、标签和任务入口；时间：2026-11-11；作者：lq。
+#[cfg(feature = "ui-tests")]
+pub use services_ui::run_layout_smoke;
+// 功能：文件夹分组验收只在测试构建开放；时间：2026-11-11；作者：lq。
+#[cfg(feature = "ui-tests")]
+pub use connection_groups::smoke::run_group_smoke;
 
 // 功能：独立验证 Kit 树、虚拟表和停靠组件，不接触正式配置；时间：2026-11-10；作者：lq。
 #[cfg(any(feature = "component-lab", feature = "ui-tests"))]

@@ -1,0 +1,42 @@
+# 功能：后台连接、终端、数据库与加密迁移服务；时间：2026-11-10；作者：lq。
+[package]
+name = "qds6-services"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+qds6-core.workspace = true
+qds6-storage.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+# 功能：静态编入 OpenSSL，避免发行包依赖本机 Homebrew；时间：2026-11-11；作者：lq。
+ssh2 = { version = "0.9", features = ["vendored-openssl"] }
+alacritty_terminal = "0.25"
+keyring = { version = "3.6", features = ["apple-native"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "mysql", "postgres", "bigdecimal", "chrono", "json", "uuid"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
+futures-util = "0.3"
+sha2 = "0.10"
+base64 = "0.22"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+rand = "0.8"
+zeroize = "1"
+quick-xml = { version = "0.38", features = ["serialize"] }
+# 功能：后台检查 GitHub 正式版本，使用系统根证书和语义版本比较；时间：2026-11-11；作者：lq。
+reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
+semver = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
+
+# 功能：仅自动化 UI 验收使用隔离内存草稿密钥，发行构建不启用；时间：2026-11-10；作者：lq。
+[features]
+test-support = []

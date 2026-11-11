@@ -5,6 +5,14 @@ use rusqlite::{Connection, params};
 use std::path::Path;
 use thiserror::Error;
 
+// 功能：软件偏好独立存储，不混入连接导出或凭据；时间：2026-11-11；作者：lq。
+mod preferences;
+pub use preferences::{AppPreferences, ColorTheme};
+
+// 功能：独立分组目录及原子归组操作，不接触凭据；时间：2026-11-11；作者：lq。
+mod groups;
+pub use groups::{ConnectionGroup, GroupScope, validate_group_name};
+
 /// 功能：区分数据库、模型与未来格式错误；时间：2026-11-10；作者：lq。
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -16,6 +24,16 @@ pub enum StoreError {
     Validation(#[from] qds6_core::ProfileError),
     #[error("配置来自更新版本，当前版本不能修改")]
     NewerSchema,
+    #[error("导入包含重复连接 ID")]
+    DuplicateId,
+    #[error("软件设置值超出支持范围")]
+    InvalidPreferences,
+    #[error("分组名称须为 1–256 个字符，不能含控制字符或使用“未分组”")]
+    InvalidGroup,
+    #[error("此分组名称已存在")]
+    DuplicateGroup,
+    #[error("分组或连接已不存在，请刷新列表")]
+    MissingGroupTarget,
 }
 
 /// 功能：拥有独立 SQLite 连接，不跨 UI 线程共享；时间：2026-11-10；作者：lq。
@@ -32,6 +50,13 @@ impl ProfileStore {
         }
         let tx = db.transaction()?;
         tx.execute_batch("CREATE TABLE IF NOT EXISTS profiles (id TEXT PRIMARY KEY NOT NULL, body TEXT NOT NULL); PRAGMA user_version = 1;")?;
+        // 功能：增量建立软件偏好表，保留所有已有连接；时间：2026-11-11；作者：lq。
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS preferences (id INTEGER PRIMARY KEY CHECK (id = 1), body TEXT NOT NULL);")?;
+        // 功能：增量兼容旧库，按协议分区回填已有分组，保留空文件夹与收起状态；时间：2026-11-11；作者：lq。
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS connection_groups (scope TEXT NOT NULL, name TEXT NOT NULL, collapsed INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(scope, name));
+            INSERT OR IGNORE INTO connection_groups(scope, name)
+            SELECT CASE WHEN json_extract(body, '$.protocol') IN ('ssh', 'sftp') THEN 'servers' ELSE 'databases' END, json_extract(body, '$.group')
+            FROM profiles WHERE json_valid(body) AND json_extract(body, '$.group') <> '';")?;
         tx.commit()?;
         Ok(Self(db))
     }
@@ -54,6 +79,42 @@ impl ProfileStore {
         let body = serde_json::to_string(profile)?;
         let tx = self.0.transaction()?;
         tx.execute("INSERT INTO profiles(id, body) VALUES (?1, ?2) ON CONFLICT(id) DO UPDATE SET body=excluded.body", params![profile.id.to_string(), body])?;
+        groups::ensure_profile_group(&tx, profile)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 功能：原子删除一个配置，凭据由上层显式处理；时间：2026-11-10；作者：lq。
+    pub fn delete(&mut self, id: &str) -> Result<(), StoreError> {
+        self.0.execute("DELETE FROM profiles WHERE id=?1", [id])?;
+        Ok(())
+    }
+
+    /// 功能：预先验证全部配置，再事务合并或替换；任意失败保留原库；时间：2026-11-10；作者：lq。
+    pub fn restore(
+        &mut self,
+        profiles: &[ConnectionProfile],
+        replace: bool,
+    ) -> Result<(), StoreError> {
+        let mut ids = std::collections::HashSet::new();
+        let mut bodies = Vec::with_capacity(profiles.len());
+        for profile in profiles {
+            profile.validate()?;
+            if !ids.insert(profile.id) {
+                return Err(StoreError::DuplicateId);
+            }
+            bodies.push((profile.id.to_string(), serde_json::to_string(profile)?));
+        }
+        let tx = self.0.transaction()?;
+        if replace {
+            tx.execute("DELETE FROM profiles", [])?;
+        }
+        for (id, body) in bodies {
+            tx.execute("INSERT INTO profiles(id,body) VALUES (?1,?2) ON CONFLICT(id) DO UPDATE SET body=excluded.body", params![id, body])?;
+        }
+        for profile in profiles {
+            groups::ensure_profile_group(&tx, profile)?;
+        }
         tx.commit()?;
         Ok(())
     }

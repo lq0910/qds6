@@ -10,6 +10,8 @@ pub use gpui_kit::assets::IconName as UiIcon;
 pub const BRAND_IMAGE: &str = "brand/qds6.png";
 /// 功能：单色品牌路径随当前主题前景色绘制；时间：2026-11-10；作者：lq。
 pub const BRAND_MARK: &str = "brand/qds6-mark.svg";
+/// 功能：用户提供的公众号二维码，离线嵌入关于页；时间：2026-11-11；作者：lq。
+pub const WECHAT_QR: &str = "about/wechat-qr.jpg";
 
 // 功能：选择工作台所需 Lucide 图标；保留 Kit 上游资源及许可，不复制或改署作者；时间：2026-11-10；作者：lq。
 gpui_kit::assets::icon_assets!(
@@ -48,6 +50,12 @@ gpui_kit::assets::icon_assets!(
         Play,
         LoaderCircle,
         Circle,
+        // 功能：统一标签关闭与工作台分屏图标；时间：2026-11-11；作者：lq。
+        X,
+        Columns2,
+        // 功能：连接文件夹展开和新建分组图标；时间：2026-11-11；作者：lq。
+        FolderOpen,
+        FolderPlus,
     ]
 );
 
@@ -64,6 +72,9 @@ impl AssetSource for AppAssets {
             BRAND_MARK => Ok(Some(Cow::Borrowed(include_bytes!(
                 "../../../assets/brand/qds6-mark.svg"
             )))),
+            WECHAT_QR => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../../../assets/about/wechat-qr.jpg"
+            )))),
             _ => match WorkbenchIcons.load(path)? {
                 Some(bytes) => Ok(Some(bytes)),
                 None => Assets.load(path),
@@ -76,7 +87,7 @@ impl AssetSource for AppAssets {
         let mut paths = Assets.list(path)?;
         paths.extend(WorkbenchIcons.list(path)?);
         paths.extend(
-            [BRAND_IMAGE, BRAND_MARK]
+            [BRAND_IMAGE, BRAND_MARK, WECHAT_QR]
                 .into_iter()
                 .filter(|name| name.starts_with(path))
                 .map(SharedString::from),
