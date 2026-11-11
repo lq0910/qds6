@@ -171,6 +171,8 @@ struct Workbench {
     tab: usize,
     // 功能：服务器和数据库有独立工作区入口；时间：2026-11-11；作者：lq。
     area: workspace_ui::WorkspaceArea,
+    // 功能：连接侧栏可收起，切换布局保留搜索、分组和已连接会话；时间：2026-11-11；作者：lq。
+    sidebar_visible: bool,
     // 功能：关闭工具标签保留会话内草稿，按需打开以减少常驻导航；时间：2026-11-11；作者：lq。
     form_open: bool,
     sql_open: bool,
@@ -233,6 +235,7 @@ impl Workbench {
             sql,
             tab: 0,
             area: workspace_ui::WorkspaceArea::Servers,
+            sidebar_visible: true,
             form_open: false,
             sql_open: false,
             backup_open: false,
@@ -520,7 +523,21 @@ impl Workbench {
                     },
                     move |this, _, window, cx| {
                         this.profiles.retain(|p| p.id != id);
-                        this.replace_form(ConnectionProfile::new(Protocol::Ssh), window, cx);
+                        // 功能：仅清理被删连接的表单，保留当前功能区、其他表单和活动文档；时间：2026-11-11；作者：lq。
+                        if this.form.profile.id == id {
+                            this.form = ProfileForm::new(
+                                ConnectionProfile::new(this.area.default_protocol()),
+                                window,
+                                cx,
+                            );
+                            this.watch_form(cx);
+                            this.form_dirty = false;
+                            this.form_open = false;
+                            this.advanced_connection = false;
+                            if this.tab == 1 {
+                                this.tab = 0;
+                            }
+                        }
                         this.status = "连接已删除，活动会话未关闭".into();
                     },
                     window,
@@ -595,6 +612,8 @@ impl Workbench {
     fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let list = self.connection_group_list(cx);
         v_flex()
+            .id("connection-sidebar")
+            .test_support()
             .w(px(224.))
             .h_full()
             .flex_shrink_0()
@@ -1314,7 +1333,9 @@ impl Render for Workbench {
                     .min_h_0()
                     .overflow_hidden()
                     .child(self.navigation_rail(cx))
-                    .when(self.tab != 5, |row| row.child(self.sidebar(cx)))
+                    .when(self.tab != 5 && self.sidebar_visible, |row| {
+                        row.child(self.sidebar(cx))
+                    })
                     .child(
                         v_flex()
                             .flex_1()
@@ -1477,6 +1498,12 @@ pub fn run() {
 mod smoke;
 #[cfg(feature = "ui-tests")]
 pub use services_ui::run_service_ui_smoke;
+// 功能：导出独立服务器状态验收，不进入发行构建；时间：2026-11-11；作者：lq。
+#[cfg(feature = "ui-tests")]
+pub use server_ui::status_ui::smoke::run_server_status_smoke;
+// 功能：导出隔离 SSH/SFTP 的终端留白、侧栏及文件可见性验收；时间：2026-11-11；作者：lq。
+#[cfg(feature = "ui-tests")]
+pub use server_ui::run_sidebar_files_smoke;
 #[cfg(feature = "ui-tests")]
 pub use smoke::run_ui_smoke;
 // 功能：独立布局回归覆盖最小窗口、标签和任务入口；时间：2026-11-11；作者：lq。
@@ -1492,7 +1519,13 @@ pub use connection_groups::smoke::run_group_smoke;
 // 功能：独立验证 Kit 树、虚拟表和停靠组件，不接触正式配置；时间：2026-11-10；作者：lq。
 #[cfg(any(feature = "component-lab", feature = "ui-tests"))]
 mod component_lab;
+// 功能：隔离 SQLite 下回归删除连接后的原生导航与确认行为；时间：2026-11-11；作者：lq。
+#[cfg(all(test, feature = "ui-tests"))]
+mod deletion_tests;
 #[cfg(feature = "component-lab")]
 pub use component_lab::run_component_lab;
 #[cfg(feature = "ui-tests")]
 pub use component_lab::run_component_smoke;
+// 功能：公开多表网格及查询原生验收入口；时间：2026-11-11；作者：lq。
+#[cfg(feature = "ui-tests")]
+pub use services_ui::run_database_grid_smoke;

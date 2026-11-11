@@ -50,9 +50,32 @@ impl Workbench {
             Some(cx.observe_window_appearance(window, |this, window, cx| {
                 if this.settings.preferences.theme == ColorTheme::System {
                     Theme::sync_system_appearance(Some(window), cx);
+                    this.sync_terminal_appearance(cx);
                     cx.notify();
                 }
             }));
+    }
+
+    /// 功能：当前和新建终端共用亮度解析，自动模式跟随软件的实际外观；时间：2026-11-11；作者：lq。
+    pub(super) fn resolved_terminal_theme(&self, cx: &App) -> qds6_core::TerminalTheme {
+        let preferences = &self.settings.preferences;
+        if preferences.terminal_follow_appearance {
+            preferences
+                .terminal_theme
+                .for_appearance(cx.theme().mode == ThemeMode::Dark)
+        } else {
+            preferences.terminal_theme
+        }
+    }
+
+    /// 功能：只更新变化的终端配色，不改临时字号、输出或 SSH 会话；时间：2026-11-11；作者：lq。
+    fn sync_terminal_appearance(&self, cx: &mut Context<Self>) {
+        let theme = self.resolved_terminal_theme(cx);
+        for server in &self.services.servers {
+            if let Some(terminal) = server.read(cx).terminal.clone() {
+                terminal.update(cx, |terminal, cx| terminal.set_theme(theme, cx));
+            }
+        }
     }
 
     /// 功能：可点击的四套终端配色预览，浅深色固定各两套且独立保存；时间：2026-11-11；作者：lq。
@@ -60,7 +83,7 @@ impl Workbench {
         let mut choices = h_flex().w_full().gap_3();
         for theme in qds6_core::TerminalTheme::ALL {
             let palette = theme.palette();
-            let selected = self.settings.preferences.terminal_theme == theme;
+            let selected = self.resolved_terminal_theme(cx) == theme;
             choices = choices.child(
                 Button::new(theme.id())
                     .flex_1()
@@ -139,6 +162,8 @@ impl Workbench {
                     .on_click(cx.listener(move |this, _, window, cx| {
                         let mut preferences = this.settings.preferences.clone();
                         preferences.terminal_theme = theme;
+                        // 功能：点击具体配色即固定，重新勾选联动即可恢复自动切换；时间：2026-11-11；作者：lq。
+                        preferences.terminal_follow_appearance = false;
                         this.save_preferences(preferences, window, cx);
                     })),
             );
@@ -150,9 +175,23 @@ impl Workbench {
             .border_color(cx.theme().border)
             .child(Self::section_heading(
                 "终端配色",
-                "独立于界面主题，应用到当前和新建终端。",
+                "默认随软件切换深浅色；选择下方配色可固定使用。",
                 cx,
             ))
+            // 功能：显式联动开关，兼容偏好固定终端背景的使用方式；时间：2026-11-11；作者：lq。
+            .child(
+                Checkbox::new("terminal-follow-appearance")
+                    .label("跟随软件深浅色")
+                    .checked(self.settings.preferences.terminal_follow_appearance)
+                    .disabled(!self.settings.ready || self.settings.saving)
+                    .on_click(cx.listener(|this, checked: &bool, window, cx| {
+                        let mut preferences = this.settings.preferences.clone();
+                        // 功能：关闭联动时固定当前可见颜色，避免开关本身造成跳色；时间：2026-11-11；作者：lq。
+                        preferences.terminal_theme = this.resolved_terminal_theme(cx);
+                        preferences.terminal_follow_appearance = *checked;
+                        this.save_preferences(preferences, window, cx);
+                    })),
+            )
             .child(choices)
     }
 
@@ -214,19 +253,8 @@ impl Workbench {
                 }
             }
         }
-        // 功能：配色变化只重绘终端，不重置临时字号和现有输出；时间：2026-11-11；作者：lq。
-        if !self.settings.ready
-            || preferences.terminal_theme != self.settings.preferences.terminal_theme
-        {
-            for server in &self.services.servers {
-                if let Some(terminal) = server.read(cx).terminal.clone() {
-                    terminal.update(cx, |terminal, cx| {
-                        terminal.set_theme(preferences.terminal_theme, cx)
-                    });
-                }
-            }
-        }
         self.settings.preferences = preferences;
+        self.sync_terminal_appearance(cx);
     }
 
     /// 功能：后台原子保存，成功后应用，失败保留原偏好并明确反馈；时间：2026-11-11；作者：lq。

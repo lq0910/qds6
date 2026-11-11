@@ -83,6 +83,67 @@ mod tests {
         drop(cx);
         std::fs::remove_dir_all(temporary).unwrap();
     }
+
+    /// 功能：含密码预览的最终确认只显示数量，取消不写连接、Keychain 或恢复点；时间：2026-11-11；作者：lq。
+    #[test]
+    fn password_import_confirmation_cancel_keeps_preview_without_writing() {
+        let temporary =
+            std::env::temp_dir().join(format!("qds6-import-cancel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&temporary).unwrap();
+        let mut cx = TestAppContext::single();
+        cx.skip_drawing();
+        cx.update(gpui_kit::init);
+        let (handle, view) = cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                cx.new(|cx| {
+                    Workbench::new_with_store(
+                        Some(temporary.join("connections.sqlite3")),
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .unwrap()
+        });
+        cx.update_window(handle, |_, window, cx| {
+            view.update(cx, |state, cx| {
+                let mut profile = qds6_core::ConnectionProfile::new(qds6_core::Protocol::MySql);
+                profile.name = "fixture import".into();
+                profile.host = "localhost".into();
+                let mut config = qds6_services::backup::Configuration::new(&[profile.clone()]);
+                config
+                    .secrets
+                    .insert(profile.id, "public-test-secret".into());
+                state.services.preview = Some(config);
+                state.services.backup_mode = 1;
+                state.confirm_configuration_restore(window, cx);
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        let (title, detail) = cx.pending_prompt().unwrap();
+        assert!(title.contains("导入"));
+        assert!(detail.contains("1 个密码"));
+        assert!(!detail.contains("public-test-secret"));
+        cx.simulate_prompt_answer("取消");
+        cx.run_until_parked();
+        cx.read(|cx| {
+            let state = view.read(cx);
+            assert!(state.profiles.is_empty());
+            assert_eq!(state.services.preview.as_ref().unwrap().secrets.len(), 1);
+            assert!(!state.services.busy);
+        });
+        assert!(!std::fs::read_dir(&temporary).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("before-restore")
+        }));
+        drop(cx);
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
 }
 
 impl Workbench {
@@ -131,7 +192,12 @@ impl Workbench {
             content = content
                 .child(Self::section_heading(
                     "选择来源",
-                    "仅迁移受支持的连接字段，密码和私钥需重新配置。",
+                    // 功能：按来源准确声明密码迁移能力，不将暂不支持说成技术不可迁移；时间：2026-11-11；作者：lq。
+                    if matches!(self.services.import_source, 1 | 3) {
+                        "连接与账号一并导入；已识别的保存密码确认后写入系统凭据库，私钥需重新选择。"
+                    } else {
+                        "迁移受支持的连接字段与账号；此来源的密码需补填，私钥需重新选择。"
+                    },
                     cx,
                 ))
                 .child(sources);
@@ -272,8 +338,26 @@ impl Workbench {
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .text_ellipsis()
-                                    .child(profile.name.clone()),
+                                    .child(div().text_ellipsis().child(profile.name.clone()))
+                                    // 功能：逐连接显示凭据状态，界面只查询是否存在，不读取明文；时间：2026-11-11；作者：lq。
+                                    .when(
+                                        mode == 1 && matches!(self.services.import_source, 1 | 3),
+                                        |v| {
+                                            v.child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(
+                                                        if preview.secrets.contains_key(&profile.id)
+                                                        {
+                                                            "密码可迁移"
+                                                        } else {
+                                                            "认证信息需补全，详见兼容报告"
+                                                        },
+                                                    ),
+                                            )
+                                        },
+                                    ),
                             )
                             .child(
                                 div()
@@ -289,11 +373,11 @@ impl Workbench {
                         .gap_4()
                         .border_t_1()
                         .border_color(cx.theme().border)
-                        .child(
-                            div()
-                                .font_semibold()
-                                .child(format!("预览 · {} 个连接", preview.profiles.len())),
-                        )
+                        .child(div().font_semibold().child(format!(
+                            "预览 · {} 个连接 · {} 个密码可迁移",
+                            preview.profiles.len(),
+                            preview.secrets.len()
+                        )))
                         .child(rows)
                         .when(preview.profiles.len() > 20, |v| {
                             v.child(div().text_xs().child("仅展示前 20 个连接。"))
@@ -483,11 +567,20 @@ impl Workbench {
             qds6_services::migration::Source::Navicat,
         ][self.services.import_source];
         let path = PathBuf::from(self.services.backup_path.read(cx).value().as_str());
+        // 功能：只对 Navicat 重新导入匹配旧版遗漏数据库名的连接，不提前修改本机配置；时间：2026-11-11；作者：lq。
+        let existing = self.profiles.clone();
         self.services.preview = None;
         self.services.import_report.clear();
         self.service_job(
             "正在解析导入预览…",
-            move || qds6_services::migration::preview(source, &backup::read_bounded(&path)?),
+            move || {
+                let mut preview =
+                    qds6_services::migration::preview(source, &backup::read_bounded(&path)?)?;
+                if matches!(source, qds6_services::migration::Source::Navicat) {
+                    preview.reuse_legacy_navicat_ids(&existing);
+                }
+                Ok(preview)
+            },
             |this, preview, _, _| {
                 this.services.import_report = preview.warnings;
                 this.services.preview = Some(preview.config);
@@ -570,22 +663,37 @@ impl Workbench {
         };
         let storage = self.storage_path.clone();
         let replace = self.services.replace;
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            "确认恢复连接配置？",
-            Some(if replace {
-                "现有连接将被替换；会先创建本机快照。不会自动连接服务器。"
+        // 功能：最终确认明确本次凭据写入数量，取消不会提前写入 Keychain；时间：2026-11-11；作者：lq。
+        let secret_count = config.secrets.len();
+        let importing = self.services.backup_mode == 1;
+        let detail = format!(
+            "{}其中 {secret_count} 个密码将在确认后写入系统凭据库。不会自动连接服务器。",
+            if replace {
+                "现有连接将被替换；会先创建本机快照。"
             } else {
                 "同 ID 连接将更新，新 ID 连接将添加；会先创建本机快照。"
-            }),
-            &["取消", "恢复"],
+            }
+        );
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            if importing {
+                "确认导入连接配置？"
+            } else {
+                "确认恢复连接配置？"
+            },
+            Some(&detail),
+            &["取消", if importing { "导入" } else { "恢复" }],
             cx,
         );
         cx.spawn_in(window, async move |this, cx| {
             if answer.await == Ok(1) {
                 let _ = this.update_in(cx, |this, window, cx| {
                     this.service_job(
-                        "正在创建快照并恢复…",
+                        if importing {
+                            "正在创建快照并导入…"
+                        } else {
+                            "正在创建快照并恢复…"
+                        },
                         move || {
                             let path = storage.map(Ok).unwrap_or_else(Self::store_path)?;
                             let snapshot = path.with_file_name(backup::snapshot_name());
@@ -596,12 +704,16 @@ impl Workbench {
                                 store.groups().map_err(|e| e.to_string())?,
                             ))
                         },
-                        |this, (profiles, groups), _, cx| {
+                        move |this, (profiles, groups), _, cx| {
                             this.profiles = profiles;
                             // 功能：导入/恢复后立即显示目录，不需手工重新读取；时间：2026-11-11；作者：lq。
                             this.groups.set_items(groups, cx);
                             this.services.preview = None;
-                            this.status = "恢复完成，恢复前快照已保留在应用数据目录".into();
+                            this.status = format!(
+                                "{}完成，{secret_count} 个密码已写入系统凭据库；操作前快照已保留",
+                                if importing { "导入" } else { "恢复" }
+                            )
+                            .into();
                         },
                         window,
                         cx,

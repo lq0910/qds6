@@ -48,9 +48,13 @@ impl Workbench {
     /// 功能：切换功能区时保留服务器实体、数据库结果及输入内容；时间：2026-11-11；作者：lq。
     pub(super) fn switch_area(&mut self, area: WorkspaceArea, cx: &mut Context<Self>) {
         if self.area == area && self.tab != 5 {
+            // 功能：侧栏收起后可点当前区域入口找回连接列表；时间：2026-11-11；作者：lq。
+            self.sidebar_visible = true;
+            cx.notify();
             return;
         }
         self.area = area;
+        self.sidebar_visible = true;
         let target = match area {
             WorkspaceArea::Servers if !self.services.servers.is_empty() => {
                 WorkspaceTarget::Server(self.services.active_server)
@@ -87,8 +91,15 @@ impl Workbench {
             }
             WorkspaceTarget::Sql => {
                 self.area = WorkspaceArea::Databases;
-                self.sql_open = true;
-                self.tab = 2;
+                if self.services.database.is_some() {
+                    self.services.query_open = true;
+                    self.services.query_active = true;
+                    self.services.page = 3;
+                    self.tab = 3;
+                } else {
+                    self.sql_open = true;
+                    self.tab = 2;
+                }
             }
             WorkspaceTarget::Backup => {
                 self.backup_open = true;
@@ -222,7 +233,12 @@ impl Workbench {
                 "数据库"
             }
             .to_string(),
-            UiIcon::PanelLeft,
+            // 功能：概览图标标识工作对象，与相邻的侧栏收放按钮区分；时间：2026-11-11；作者：lq。
+            if self.area == WorkspaceArea::Servers {
+                UiIcon::Server
+            } else {
+                UiIcon::Database
+            },
             false,
         )];
         if (self.form_open || current == Connection)
@@ -268,7 +284,7 @@ impl Workbench {
                         self.services.database_identity.clone()
                     },
                     UiIcon::Database,
-                    false,
+                    true,
                 ));
             }
             if self.sql_open || current == Sql {
@@ -287,7 +303,12 @@ impl Workbench {
             items.push((Settings, "设置".into(), UiIcon::Settings, true));
         }
         let selected = items.iter().position(|item| item.0 == current).unwrap_or(0);
-        let identity = (current, items.len(), window.viewport_size().width);
+        // 功能：侧栏收放后重新揭示当前标签，避免活动会话被挤出可视区；时间：2026-11-11；作者：lq。
+        let identity = (
+            current,
+            items.len(),
+            window.viewport_size().width - px(if self.sidebar_visible { 224. } else { 0. }),
+        );
         if self.last_workspace_tab != Some(identity) {
             let scroll = self.workspace_scroll.clone();
             let view = cx.entity_id();
@@ -312,6 +333,7 @@ impl Workbench {
                 Backup => "workspace-close-backup".into(),
                 Settings => "workspace-close-settings".into(),
                 Server(index) => format!("server-close-{index}"),
+                Database => "workspace-close-database".into(),
                 _ => String::new(),
             };
             bar = bar.child(
@@ -340,6 +362,8 @@ impl Workbench {
                                 .icon(UiIcon::X)
                                 .tooltip(if matches!(target, Server(_)) {
                                     "断开此服务器"
+                                } else if target == Database {
+                                    "关闭数据库连接"
                                 } else {
                                     "关闭标签 · 草稿保留在本次会话"
                                 })
@@ -347,6 +371,10 @@ impl Workbench {
                                     cx.stop_propagation();
                                     if let Server(index) = target {
                                         this.close_server(index, window, cx);
+                                        return;
+                                    }
+                                    if target == Database {
+                                        this.close_database(window, cx);
                                         return;
                                     }
                                     match target {
@@ -364,13 +392,33 @@ impl Workbench {
                     }),
             );
         }
-        div()
+        h_flex()
             .id("workspace-tab-strip")
             .test_support()
             .w_full()
+            .min_w_0()
             .flex_shrink_0()
+            // 功能：收放按钮固定在标签栏左端，收起后仍能一键展开；时间：2026-11-11；作者：lq。
+            .when(self.tab != 5, |row| {
+                row.child(
+                    Button::new("toggle-connection-sidebar")
+                        .ghost()
+                        .small()
+                        .icon(UiIcon::PanelLeft)
+                        .selected(self.sidebar_visible)
+                        .tooltip(if self.sidebar_visible {
+                            "收起连接列表"
+                        } else {
+                            "展开连接列表"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.sidebar_visible = !this.sidebar_visible;
+                            cx.notify();
+                        })),
+                )
+            })
             // 功能：复用 Kit 标签栏底边，避免双重分隔线；时间：2026-11-11；作者：lq。
-            .child(bar)
+            .child(div().flex_1().min_w_0().child(bar))
     }
 
     /// 功能：按稳定实体关闭服务器，文件保存中禁止断开，脏草稿必须明确确认；时间：2026-11-11；作者：lq。

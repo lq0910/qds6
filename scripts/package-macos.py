@@ -8,6 +8,7 @@ import platform
 import plistlib
 import shutil
 import subprocess
+import tempfile
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,17 +30,23 @@ def run():
     parser = argparse.ArgumentParser()
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--output", type=Path)
-    # 功能：允许内部更新使用独立构建号并写入内容清单，区分同版本安装包；时间：2026-11-11；作者：lq。
-    parser.add_argument("--build-number", default="2026111101")
+    # 功能：构建号保存在包内，内部更新始终复用固定目录与应用名；时间：2026-11-11；作者：lq。
+    parser.add_argument("--build-number", default="2026111107")
     options = parser.parse_args()
     if not options.build_number.isascii() or not options.build_number.isdigit():
         raise SystemExit("构建号须为 ASCII 数字")
     if platform.system() != "Darwin" or platform.machine() != "arm64":
         raise SystemExit("当前脚本仅打包已验收的 Apple Silicon macOS 构建")
     version = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["package"]["version"]
-    output = options.output or ROOT / "output/release" / f"{version}-macos-arm64-internal"
-    if output.exists():
-        raise SystemExit("输出目录已存在；选择新路径，避免覆盖已验收包")
+    destination = (options.output or ROOT / "output/release" / f"{version}-macos-arm64-internal").resolve()
+    # 功能：只替换已识别的本项目内部包，生成成功前保留原产物；时间：2026-11-11；作者：lq。
+    if destination.exists():
+        manifest_path = destination / "build-manifest.json"
+        if destination.is_symlink() or not manifest_path.is_file():
+            raise SystemExit("输出目录不是已识别的 QDS6 内部包，拒绝覆盖")
+        old_manifest = json.loads(manifest_path.read_text())
+        if old_manifest.get("channel") != "internal" or old_manifest.get("platform") != "aarch64-apple-darwin":
+            raise SystemExit("输出目录不是 QDS6 Mac 内部包，拒绝覆盖")
     if not options.skip_build:
         print(command(["cargo", "build", "-p", "qds6-app", "--release", "--locked"]))
     binary = ROOT / "target/release/qds6"
@@ -51,7 +58,10 @@ def run():
     notices = ROOT / "output/third-party"
     if not (notices / "dependencies.json").exists():
         raise SystemExit("请先运行 scripts/collect-licenses.py --fetch-missing")
-    output.mkdir(parents=True)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = tempfile.TemporaryDirectory(prefix=".qds6-package-", dir=destination.parent)
+    output = Path(temporary.name) / "package"
+    output.mkdir()
     stage = output / "staging"
     app = stage / "QDS6.app"
     executable = app / "Contents/MacOS/qds6"
@@ -105,7 +115,12 @@ def run():
     (output / "SHA256SUMS").write_text("\n".join(f"{sha256(path)}  {path.name}" for path in (zip_file, dmg_file)) + "\n")
     (output / "dynamic-libraries.txt").write_text(dependencies)
     shutil.copy2(resources / "build-manifest.json", output / "build-manifest.json")
-    print(f"Created internal macOS package: {output}")
+    # 功能：签名、归档和 DMG 验证完成后才覆盖，输出始终只保留当前包；时间：2026-11-11；作者：lq。
+    if destination.exists():
+        shutil.rmtree(destination)
+    output.rename(destination)
+    temporary.cleanup()
+    print(f"Created internal macOS package: {destination}")
 
 
 if __name__ == "__main__":

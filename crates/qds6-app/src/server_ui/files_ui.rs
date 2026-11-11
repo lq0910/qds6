@@ -1,6 +1,12 @@
-//! 功能：原生懒加载文件树、双向拖放和串行传输；时间：2026-11-11；作者：lq。
+//! 功能：原生目录导航、当前目录详情、多选拖放和串行传输；时间：2026-11-11；作者：lq。
 
 use super::*;
+// 功能：目录树与当前目录详情列表分离；时间：2026-11-11；作者：lq。
+mod explorer;
+use explorer::{local_owner, local_permissions};
+// 功能：真实 SFTP 隐藏目录和原生侧栏布局专项回归；时间：2026-11-11；作者：lq。
+#[cfg(feature = "ui-tests")]
+pub(super) mod smoke;
 use gpui_kit::component::{
     list::ListItem,
     menu::{DropdownMenu, PopupMenuItem},
@@ -32,6 +38,15 @@ impl FileSide {
 /// 功能：按绝对路径缓存子目录，目录只在展开时后台读取；时间：2026-11-11；作者：lq。
 pub(super) struct FileBrowser {
     pub(super) root: PathBuf,
+    // 功能：树根与当前目录独立，多选范围始终限定当前可见层级；时间：2026-11-11；作者：lq。
+    current: PathBuf,
+    selection: BTreeSet<PathBuf>,
+    anchor: Option<PathBuf>,
+    focus: FocusHandle,
+    scroll: UniformListScrollHandle,
+    // 功能：每侧独立控制目录导航与详情横向位置；时间：2026-11-11；作者：lq。
+    horizontal: ScrollHandle,
+    show_directories: bool,
     pub(super) selected: Option<sftp::Entry>,
     tree: Entity<TreeState>,
     entries: BTreeMap<PathBuf, Vec<sftp::Entry>>,
@@ -41,18 +56,37 @@ pub(super) struct FileBrowser {
     generation: u64,
 }
 impl FileBrowser {
-    /// 功能：以选中目录或文件父目录确定按钮传输目标；时间：2026-11-11；作者：lq。
+    /// 功能：统计隐藏项，避免把 /root 等主目录因过滤而误报为空；时间：2026-11-11；作者：lq。
+    fn hidden_count(&self, path: &Path) -> usize {
+        self.entries
+            .get(path)
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry.name.starts_with('.'))
+            .count()
+    }
+
+    /// 功能：未加载、失败、隐藏过滤与真正空目录使用不同提示；时间：2026-11-11；作者：lq。
+    fn empty_hint(&self, path: &Path, show_hidden: bool) -> String {
+        if self.loading.contains(path) {
+            "正在读取…".into()
+        } else if self.errors.contains_key(path) {
+            "读取失败 · 收起再展开重试".into()
+        } else if self.entries.contains_key(path) {
+            let hidden = self.hidden_count(path);
+            if !show_hidden && hidden > 0 {
+                format!("仅含 {hidden} 个隐藏项 · 勾选显示隐藏文件")
+            } else {
+                "空文件夹".into()
+            }
+        } else {
+            "展开以读取".into()
+        }
+    }
+
+    /// 功能：按钮和空白区拖放始终传入对侧当前目录；时间：2026-11-11；作者：lq。
     pub(super) fn destination(&self) -> PathBuf {
-        self.selected
-            .as_ref()
-            .map(|entry| {
-                if entry.directory && !entry.symlink {
-                    entry.path.clone()
-                } else {
-                    entry.path.parent().unwrap_or(&self.root).to_path_buf()
-                }
-            })
-            .unwrap_or_else(|| self.root.clone())
+        self.current.clone()
     }
     /// 功能：统一定位根节点和缓存文件，不解析占位提示行；时间：2026-11-11；作者：lq。
     fn entry(&self, path: &Path) -> Option<sftp::Entry> {
@@ -68,6 +102,9 @@ impl FileBrowser {
                 symlink: false,
                 size: 0,
                 permissions: 0,
+                modified: None,
+                uid: None,
+                gid: None,
             })
         } else {
             self.entries
@@ -84,7 +121,7 @@ impl FileBrowser {
 struct FileDrag {
     owner: EntityId,
     side: FileSide,
-    entry: sftp::Entry,
+    entries: std::rc::Rc<std::cell::RefCell<Vec<sftp::Entry>>>,
 }
 impl Render for FileDrag {
     /// 功能：拖动预览明确展示方向和文件名；时间：2026-11-11；作者：lq。
@@ -105,7 +142,11 @@ impl Render for FileDrag {
                 })
                 .small(),
             )
-            .child(self.entry.name.clone())
+            .child(if self.entries.borrow().len() == 1 {
+                self.entries.borrow()[0].name.clone()
+            } else {
+                format!("{} 个项目", self.entries.borrow().len())
+            })
     }
 }
 
@@ -171,7 +212,7 @@ impl FilesUi {
 }
 
 impl ServerWorkspace {
-    /// 功能：安装原生树展开事件与键盘选中订阅；时间：2026-11-11；作者：lq。
+    /// 功能：安装两侧目录树的原生展开和收起订阅；时间：2026-11-11；作者：lq。
     pub(super) fn new_files_ui(window: &mut Window, cx: &mut Context<Self>) -> FilesUi {
         let local = cx.new(|cx| TreeState::new(cx));
         let remote = cx.new(|cx| TreeState::new(cx));
@@ -201,21 +242,17 @@ impl ServerWorkspace {
                     cx.notify();
                 },
             ));
-            subscriptions.push(cx.observe_in(state, window, move |this, state, _, cx| {
-                let selected = state
-                    .read(cx)
-                    .selected_item()
-                    .map(|item| PathBuf::from(item.id.as_str()));
-                let browser = this.services.files.browser_mut(side);
-                if browser.selected.as_ref().map(|entry| &entry.path) != selected.as_ref() {
-                    browser.selected = selected.and_then(|path| browser.entry(&path));
-                    cx.notify();
-                }
-            }));
         }
         // 功能：树根初始由现有地址栏提供，首次读取成功再转成真实绝对路径；时间：2026-11-11；作者：lq。
         let browser = |tree| FileBrowser {
             root: PathBuf::new(),
+            current: PathBuf::new(),
+            selection: BTreeSet::new(),
+            anchor: None,
+            focus: cx.focus_handle(),
+            scroll: UniformListScrollHandle::new(),
+            horizontal: ScrollHandle::new(),
+            show_directories: true,
             tree,
             selected: None,
             entries: BTreeMap::new(),
@@ -237,6 +274,10 @@ impl ServerWorkspace {
 
     /// 功能：按需重建可见树并恢复选中路径，保留键盘导航与滚动状态；时间：2026-11-11；作者：lq。
     fn rebuild_tree(&mut self, side: FileSide, cx: &mut Context<Self>) {
+        self.services
+            .files
+            .browser_mut(side)
+            .prune_selection(self.services.show_hidden);
         let browser = self.services.files.browser(side);
         let items = if browser.root.as_os_str().is_empty() {
             vec![]
@@ -248,10 +289,7 @@ impl ServerWorkspace {
                 0,
             )]
         };
-        let selected = browser
-            .selected
-            .as_ref()
-            .map(|entry| SharedString::from(entry.path.display().to_string()));
+        let selected = Some(SharedString::from(browser.current.display().to_string()));
         let tree = browser.tree.clone();
         tree.update(cx, |state, cx| {
             state.set_items(items, cx);
@@ -275,7 +313,9 @@ impl ServerWorkspace {
             .get(path)
             .into_iter()
             .flatten()
-            .filter(|entry| hidden || !entry.name.starts_with('.'))
+            .filter(|entry| {
+                entry.directory && !entry.symlink && (hidden || !entry.name.starts_with('.'))
+            })
             .map(|entry| {
                 if entry.directory && !entry.symlink && depth < 64 {
                     Self::tree_node(&entry.path, browser, hidden, depth + 1)
@@ -287,14 +327,13 @@ impl ServerWorkspace {
         if !children.is_empty() {
             node.children(children)
         } else {
-            let hint = if browser.loading.contains(path) {
-                "正在读取…"
-            } else if browser.errors.contains_key(path) {
-                "读取失败 · 收起再展开重试"
-            } else if browser.entries.contains_key(path) {
-                "空文件夹"
+            let hint = if browser.entries.contains_key(path)
+                && !browser.loading.contains(path)
+                && !browser.errors.contains_key(path)
+            {
+                "无子文件夹".into()
             } else {
-                "展开以读取"
+                browser.empty_hint(path, hidden)
             };
             node.child(TreeItem::new(format!("qds6-placeholder:{id}"), hint).disabled(true))
         }
@@ -321,7 +360,14 @@ impl ServerWorkspace {
                 path: entry.path(),
                 name,
                 size: metadata.len(),
-                permissions: 0,
+                permissions: local_permissions(&metadata),
+                modified: metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|time| time.as_secs()),
+                uid: local_owner(&metadata).0,
+                gid: local_owner(&metadata).1,
                 directory: metadata.is_dir(),
                 symlink: metadata.is_symlink(),
             });
@@ -350,7 +396,7 @@ impl ServerWorkspace {
             return;
         }
         let generation = browser.generation;
-        let is_root = path == browser.root;
+        let is_root = path == browser.current;
         let requested = path.clone();
         self.rebuild_tree(side, cx);
         cx.spawn_in(window, async move |this, cx| {
@@ -384,6 +430,8 @@ impl ServerWorkspace {
                     return;
                 }
                 browser.loading.remove(&requested);
+                let is_current = is_root && browser.current == requested;
+                let mut recovered_error = None;
                 match result {
                     Ok((path, entries)) => {
                         if browser.entries.values().map(Vec::len).sum::<usize>()
@@ -396,17 +444,17 @@ impl ServerWorkspace {
                                 "展开的目录超过 100000 项，请切换树根".into(),
                             );
                         } else {
-                            if is_root && browser.root != path {
-                                browser.expanded.remove(&browser.root);
-                                browser.root = path.clone();
+                            if is_current && browser.current != path {
+                                if browser.root == requested {
+                                    browser.root = path.clone();
+                                }
+                                browser.current = path.clone();
                                 browser.expanded.insert(path.clone());
                             }
-                            browser.errors.remove(&requested);
+                            recovered_error = browser.errors.remove(&requested);
                             browser.entries.insert(path.clone(), entries);
-                            if let Some(selected) = browser.selected.as_ref() {
-                                browser.selected = browser.entry(&selected.path);
-                            }
-                            if is_root {
+                            browser.prune_selection(this.services.show_hidden);
+                            if is_current {
                                 let input = if side == FileSide::Local {
                                     &this.services.local_directory
                                 } else {
@@ -423,6 +471,11 @@ impl ServerWorkspace {
                         this.status = error.into();
                         this.error = true;
                     }
+                }
+                // 功能：同一路径重试成功后清理对应旧错误，不覆盖其他文件操作的反馈；时间：2026-11-11；作者：lq。
+                if recovered_error.as_deref() == Some(this.status.as_ref()) && this.error {
+                    this.status = "服务器已连接 · 终端与文件互不阻塞".into();
+                    this.error = false;
                 }
                 this.rebuild_tree(side, cx);
                 cx.notify();
@@ -443,26 +496,9 @@ impl ServerWorkspace {
         if path.as_os_str().is_empty() {
             return;
         }
-        let browser = self.services.files.browser_mut(side);
-        if browser.root != path {
-            browser.generation += 1;
-            browser.root = path.clone();
-            browser.entries.clear();
-            browser.loading.clear();
-            browser.errors.clear();
-            browser.selected = None;
-            browser.expanded.clear();
-            browser.expanded.insert(path.clone());
-        }
-        let mut paths = vec![path.clone()];
-        paths.extend(
-            browser
-                .expanded
-                .iter()
-                .filter(|p| **p != path && browser.entries.contains_key(*p))
-                .cloned(),
-        );
-        for path in paths {
+        if self.services.files.browser(side).current != path {
+            self.navigate_directory(side, path, window, cx);
+        } else {
             self.load_directory(side, path, window, cx);
         }
     }
@@ -495,18 +531,20 @@ impl ServerWorkspace {
         cx.notify();
     }
 
-    /// 功能：选中文件或目录一键传向对侧选中目录；时间：2026-11-11；作者：lq。
+    /// 功能：当前层级选中项目批量传向对侧当前目录；时间：2026-11-11；作者：lq。
     fn transfer_selected(&mut self, side: FileSide, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(entry) = self.services.files.browser(side).selected.clone() else {
-            return;
-        };
+        let entries = self
+            .services
+            .files
+            .browser(side)
+            .selected_entries(self.services.show_hidden);
         let target_side = if side == FileSide::Local {
             FileSide::Remote
         } else {
             FileSide::Local
         };
         let destination = self.services.files.browser(target_side).destination();
-        self.enqueue_transfer(side, entry, destination, window, cx);
+        self.enqueue_batch(side, entries, destination, window, cx);
     }
 
     /// 功能：排队时冻结路径，不覆盖同名目标，拒绝符号链接及重复任务；时间：2026-11-11；作者：lq。
@@ -530,8 +568,8 @@ impl ServerWorkspace {
             target,
         };
         let files = &mut self.services.files;
-        if files.queue.len() >= 100 {
-            self.status = "传输队列已满（100 项）".into();
+        if files.queue.len() >= 20000 {
+            self.status = "传输队列已满（20000 项）".into();
         } else if files.active.iter().chain(files.queue.iter()).any(|item| {
             item.side == side && item.source == request.source && item.target == request.target
         }) {
@@ -620,23 +658,29 @@ impl ServerWorkspace {
         }));
     }
 
-    /// 功能：原生树行提供层级、图标、文件大小、选中与有效目标高亮；时间：2026-11-11；作者：lq。
+    /// 功能：本地与远程各自提供目录导航、详情列表和批量传输工具栏；时间：2026-11-11；作者：lq。
     fn browser_panel(&self, side: FileSide, cx: &mut Context<Self>) -> AnyElement {
         let browser = self.services.files.browser(side);
-        let state = browser.tree.clone();
-        let view = cx.entity();
-        let owner = view.entity_id();
+        let owner = cx.entity().entity_id();
         let input = if side == FileSide::Local {
             &self.services.local_directory
         } else {
             &self.services.remote_path
         };
-        let root = browser.root.clone();
-        let selected = browser
-            .selected
-            .as_ref()
-            .map(|entry| entry.path.display().to_string())
-            .unwrap_or_else(|| "单击选择 · 展开文件夹浏览".into());
+        let root = browser.current.clone();
+        // 功能：底部展示真实总数和隐藏项，明确目录已成功读取；时间：2026-11-11；作者：lq。
+        let hidden_count = browser.hidden_count(&root);
+        let hidden_only = !self.services.show_hidden
+            && hidden_count > 0
+            && browser
+                .entries
+                .get(&root)
+                .is_some_and(|entries| entries.len() == hidden_count);
+        let selected = format!(
+            "{} 项 · 已选 {} 项 · 双击进入 / ⌘或Ctrl多选 / Shift连选",
+            browser.visible_entries(self.services.show_hidden).len(),
+            browser.selection.len()
+        );
         let target = self
             .services
             .files
@@ -646,176 +690,11 @@ impl ServerWorkspace {
                 FileSide::Local
             })
             .destination();
-        let files = tree(&state, move |index, tree_entry, _, _, cx| {
-            let entry = view
-                .read(cx)
-                .services
-                .files
-                .browser(side)
-                .entry(Path::new(tree_entry.item().id.as_str()));
-            let name = tree_entry.item().label.clone();
-            let depth = tree_entry.depth();
-            let expanded = tree_entry.is_expanded();
-            let toggle_path = entry.as_ref().map(|entry| entry.path.clone());
-            let toggle_view = view.clone();
-            let item = ListItem::new((
-                if side == FileSide::Local {
-                    "local-entry"
-                } else {
-                    "remote-entry"
-                },
-                index,
-            ))
-            .w_full()
-            .min_w_0()
-            .h(px(28.))
-            .py_0()
-            .pl(px(6. + depth as f32 * 15.))
-            .pr_2()
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .gap_1()
-                    .child(
-                        div()
-                            .id((
-                                if side == FileSide::Local {
-                                    "local-toggle"
-                                } else {
-                                    "remote-toggle"
-                                },
-                                index,
-                            ))
-                            .test_support()
-                            .w(px(14.))
-                            .flex_shrink_0()
-                            .when(entry.as_ref().is_some_and(|e| e.directory), |v| {
-                                v.child(
-                                    Icon::new(if expanded {
-                                        UiIcon::ChevronDown
-                                    } else {
-                                        UiIcon::ChevronRight
-                                    })
-                                    .xsmall(),
-                                )
-                                .cursor_pointer()
-                                .on_click(move |_, window, cx| {
-                                    cx.stop_propagation();
-                                    if let Some(path) = &toggle_path {
-                                        toggle_view.update(cx, |this, cx| {
-                                            this.toggle_directory(side, path.clone(), window, cx)
-                                        });
-                                    }
-                                })
-                            }),
-                    )
-                    .when_some(entry.as_ref(), |v, e| {
-                        v.child(
-                            Icon::new(if e.directory {
-                                UiIcon::Folder
-                            } else {
-                                UiIcon::FileCode
-                            })
-                            .small()
-                            .text_color(cx.theme().muted_foreground),
-                        )
-                    })
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_sm()
-                            .text_ellipsis()
-                            .child(name),
-                    )
-                    .when_some(entry.as_ref().filter(|entry| !entry.directory), |v, e| {
-                        v.child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .flex_shrink_0()
-                                .child(if e.symlink {
-                                    "链接".into()
-                                } else {
-                                    format_bytes(e.size)
-                                }),
-                        )
-                    }),
-            );
-            let Some(entry) = entry else {
-                return item;
-            };
-            let clicked = entry.clone();
-            let clicked_view = view.clone();
-            let item = item.on_click(move |event, window, cx| {
-                // 功能：覆盖 Kit 默认整行展开，保留原生树的选中和键盘焦点；时间：2026-11-11；作者：lq。
-                cx.stop_propagation();
-                clicked_view.update(cx, |this, cx| {
-                    this.services.files.browser_mut(side).selected = Some(clicked.clone());
-                    let tree = this.services.files.browser(side).tree.clone();
-                    tree.update(cx, |tree, cx| {
-                        tree.set_selected_index(Some(index), cx);
-                        tree.focus(window, cx);
-                    });
-                    if event.click_count() == 2 && clicked.directory && !clicked.symlink {
-                        this.toggle_directory(side, clicked.path.clone(), window, cx);
-                    }
-                    if event.click_count() == 2
-                        && !clicked.directory
-                        && !clicked.symlink
-                        && side == FileSide::Remote
-                    {
-                        this.open_remote(clicked.path.clone(), window, cx);
-                    }
-                    cx.notify();
-                });
-            });
-            let item = if entry.path == root || entry.symlink {
-                item
-            } else {
-                item.on_drag(
-                    FileDrag {
-                        owner,
-                        side,
-                        entry: entry.clone(),
-                    },
-                    |drag, _, _, cx| cx.new(|_| drag.clone()),
-                )
-            };
-            // 功能：文件行不接收拖放，空白背景收取到当前目录；文件夹行精确收取到该目录；时间：2026-11-11；作者：lq。
-            if entry.directory && !entry.symlink {
-                let target = entry.path.clone();
-                let drop_view = view.clone();
-                item.can_drop(move |data, _, _| {
-                    data.downcast_ref::<FileDrag>()
-                        .is_some_and(|drag| drag.owner == owner && drag.side != side)
-                })
-                .drag_over::<FileDrag>(|style, _, _, cx| {
-                    style
-                        .bg(cx.theme().accent)
-                        .border_1()
-                        .border_color(cx.theme().primary)
-                })
-                .on_drop(move |drag: &FileDrag, window, cx| {
-                    cx.stop_propagation();
-                    drop_view.update(cx, |this, cx| {
-                        this.enqueue_transfer(
-                            drag.side,
-                            drag.entry.clone(),
-                            target.clone(),
-                            window,
-                            cx,
-                        )
-                    });
-                })
-            } else {
-                item
-            }
-        });
+        let directories = self.directory_tree(side, cx);
+        let files = self.directory_list(side, cx);
         let drop_view = cx.entity();
         let directory = browser.destination();
-        let error = browser.errors.get(&browser.root).cloned();
+        let error = browser.errors.get(&browser.current).cloned();
         v_flex()
             .id(if side == FileSide::Local {
                 "server-local-pane"
@@ -834,12 +713,20 @@ impl ServerWorkspace {
                     .flex_shrink_0()
                     .gap_2()
                     .child(
-                        Icon::new(if side == FileSide::Local {
-                            UiIcon::Folder
-                        } else {
-                            UiIcon::Server
-                        })
-                        .small(),
+                        Button::new(SharedString::from(format!(
+                            "toggle-directories-{}",
+                            side.id()
+                        )))
+                        .ghost()
+                        .xsmall()
+                        .icon(UiIcon::Folder)
+                        .selected(browser.show_directories)
+                        .tooltip("显示 / 收起目录树")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let browser = this.services.files.browser_mut(side);
+                            browser.show_directories = !browser.show_directories;
+                            cx.notify();
+                        })),
                     )
                     .child(
                         div()
@@ -863,7 +750,31 @@ impl ServerWorkspace {
                                 })),
                         )
                     })
+                    // 功能：仅含隐藏项时一键展示，无需猜测连接是否失败；时间：2026-11-11；作者：lq。
+                    .when(hidden_only, |row| {
+                        row.child(
+                            Button::new(SharedString::from(format!("show-hidden-{}", side.id())))
+                                .ghost()
+                                .xsmall()
+                                .label("显示隐藏文件")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.services.show_hidden = true;
+                                    this.rebuild_tree(FileSide::Local, cx);
+                                    this.rebuild_tree(FileSide::Remote, cx);
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .child(div().flex_1())
+                    .child(
+                        Button::new(SharedString::from(format!("select-all-{}", side.id())))
+                            .ghost()
+                            .xsmall()
+                            .label("全选")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.select_all_files(side, window, cx);
+                            })),
+                    )
                     .child(
                         Button::new(if side == FileSide::Local {
                             "upload"
@@ -883,12 +794,7 @@ impl ServerWorkspace {
                             "← 下载"
                         })
                         .tooltip(format!("传入 {}", target.display()))
-                        .disabled(
-                            browser
-                                .selected
-                                .as_ref()
-                                .is_none_or(|e| e.symlink || e.path == browser.root),
-                        )
+                        .disabled(browser.selection.is_empty())
                         .on_click(cx.listener(
                             move |this, _, window, cx| this.transfer_selected(side, window, cx),
                         )),
@@ -908,14 +814,14 @@ impl ServerWorkspace {
                         .xsmall()
                         .ghost()
                         .label("上级")
-                        .disabled(browser.root.parent().is_none())
+                        .disabled(browser.current.parent().is_none())
                         .on_click(cx.listener(
                             move |this, _, window, cx| {
                                 let parent = this
                                     .services
                                     .files
                                     .browser(side)
-                                    .root
+                                    .current
                                     .parent()
                                     .map(Path::to_path_buf);
                                 if let Some(parent) = parent {
@@ -978,16 +884,40 @@ impl ServerWorkspace {
                     .on_drop(move |drag: &FileDrag, window, cx| {
                         cx.stop_propagation();
                         drop_view.update(cx, |this, cx| {
-                            this.enqueue_transfer(
+                            this.enqueue_batch(
                                 drag.side,
-                                drag.entry.clone(),
+                                drag.entries.borrow().clone(),
                                 directory.clone(),
                                 window,
                                 cx,
-                            )
+                            );
                         });
                     })
-                    .child(files),
+                    .child(if browser.show_directories {
+                        h_resizable(SharedString::from(format!("file-navigation-{}", side.id())))
+                            .child(
+                                resizable_panel()
+                                    .size(px(145.))
+                                    .size_range(px(85.)..px(320.))
+                                    .child(
+                                        div()
+                                            .size_full()
+                                            .min_h_0()
+                                            .overflow_hidden()
+                                            .border_r_1()
+                                            .border_color(cx.theme().border)
+                                            .child(directories),
+                                    ),
+                            )
+                            .child(
+                                resizable_panel()
+                                    .size_range(px(140.)..Pixels::MAX)
+                                    .child(files),
+                            )
+                            .into_any_element()
+                    } else {
+                        files
+                    }),
             )
             .child(
                 div()
@@ -1006,7 +936,7 @@ impl ServerWorkspace {
             .into_any_element()
     }
 
-    /// 功能：双树占用主要空间，紧凑工具栏与底部传输状态避免挤压文件；时间：2026-11-11；作者：lq。
+    /// 功能：双侧文件管理器共享紧凑工具栏与底部传输状态；时间：2026-11-11；作者：lq。
     pub(super) fn files_page(&self, cx: &mut Context<Self>) -> AnyElement {
         if self.services.sftp.is_none() {
             return div()
@@ -1046,7 +976,7 @@ impl ServerWorkspace {
                     .child(div().flex_1())
                     .child(
                         Checkbox::new("show-hidden")
-                            .label("隐藏文件")
+                            .label("显示隐藏文件")
                             .checked(self.services.show_hidden)
                             .on_click(cx.listener(|this, checked: &bool, _, cx| {
                                 this.services.show_hidden = *checked;
@@ -1095,7 +1025,11 @@ impl ServerWorkspace {
                                     .small()
                                     .ghost()
                                     .label(label)
-                                    .disabled(self.services.busy)
+                                    .disabled(
+                                        self.services.busy
+                                            || (action != "mkdir"
+                                                && self.services.files.remote.selection.len() != 1),
+                                    )
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.file_operation(action, window, cx)
                                     }))
@@ -1207,7 +1141,7 @@ impl ServerWorkspace {
             .into_any_element()
     }
 
-    /// 功能：验收定位真实树行后发送原生鼠标事件，不直接调用传输操作；时间：2026-11-11；作者：lq。
+    /// 功能：验收定位当前目录真实文件行后发送原生鼠标事件；时间：2026-11-11；作者：lq。
     #[cfg(feature = "ui-tests")]
     pub(crate) fn file_row(&self, remote: bool, path: &Path, cx: &App) -> (&'static str, usize) {
         let side = if remote {
@@ -1215,15 +1149,14 @@ impl ServerWorkspace {
         } else {
             FileSide::Local
         };
-        let tree = &self.services.files.browser(side).tree;
-        let index = tree
-            .read(cx)
-            .index_of(&SharedString::from(path.display().to_string()))
-            .expect("file path must be visible in native tree");
-        // 功能：按需揭示目标树行，兼容 Kit 列表的显式滚动策略；时间：2026-11-11；作者：lq。
-        tree.read(cx)
-            .scroll_handle()
-            .scroll_to_item(index, ScrollStrategy::Top);
+        let _ = cx;
+        let browser = self.services.files.browser(side);
+        let index = browser
+            .visible_entries(self.services.show_hidden)
+            .iter()
+            .position(|entry| entry.path == path)
+            .expect("file path must be in the current directory");
+        browser.scroll.scroll_to_item(index, ScrollStrategy::Top);
         (
             if remote {
                 "remote-entry"

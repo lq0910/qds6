@@ -1,5 +1,9 @@
 //! 功能：独立 MySQL/PostgreSQL 连接、流式有界结果及服务端查询取消；时间：2026-11-10；作者：lq。
 
+// 功能：导出原生表数据网格服务；时间：2026-11-11；作者：lq。
+mod grid;
+pub use grid::{BrowseRequest, GridColumn, PAGE_SIZE, RowChange, TablePage};
+
 use futures_util::TryStreamExt;
 use qds6_core::{ConnectionProfile, Protocol, TlsMode};
 use sqlx::{
@@ -451,7 +455,7 @@ async fn open(profile: &ConnectionProfile, secret: &str) -> Result<Adapter, Stri
                 PgConnection::connect_with(&options)
                     .await
                     .map(Adapter::Pg)
-                    .map_err(safe_error)
+                    .map_err(|error| safe_connect_error(error, &profile.db.tls))
             }
             Protocol::MySql => {
                 let mut options = MySqlConnectOptions::new()
@@ -474,14 +478,61 @@ async fn open(profile: &ConnectionProfile, secret: &str) -> Result<Adapter, Stri
                 MySqlConnection::connect_with(&options)
                     .await
                     .map(Adapter::MySql)
-                    .map_err(safe_error)
+                    .map_err(|error| safe_connect_error(error, &profile.db.tls))
             }
             _ => Err("所选连接不是数据库".into()),
         }
     };
     tokio::time::timeout(std::time::Duration::from_secs(12), future)
         .await
-        .map_err(|_| "数据库连接超时".to_string())?
+        .map_err(|_| "数据库连接超时，请检查地址、端口、VPN 和访问白名单".to_string())?
+}
+
+/// 功能：连接阶段区分网络、认证、数据库和 TLS 错误，不显示驱动原始秘密；时间：2026-11-11；作者：lq。
+fn safe_connect_error(error: sqlx::Error, tls: &TlsMode) -> String {
+    match &error {
+        sqlx::Error::Database(database) => match database.code().as_deref() {
+            Some("28P01" | "28000" | "1045" | "1698") => {
+                return "数据库身份验证失败，请核对用户名、密码和账号允许登录的来源地址".into();
+            }
+            Some("3D000" | "1049") => {
+                return "指定数据库不存在，请核对连接配置中的数据库名称".into();
+            }
+            Some("42501" | "1044") => {
+                return "账号没有访问该数据库的权限，请核对数据库名称和授权".into();
+            }
+            _ => {}
+        },
+        sqlx::Error::Tls(_) => {
+            return "TLS 握手或证书验证失败；请核对源连接是否启用 SSL，并检查 CA 证书和主机名（高级选项）".into();
+        }
+        sqlx::Error::Io(io) => {
+            use std::io::ErrorKind;
+            return match io.kind() {
+                ErrorKind::ConnectionRefused => {
+                    "数据库端口拒绝连接，请检查服务是否启动及端口是否正确".into()
+                }
+                ErrorKind::TimedOut => "数据库连接超时，请检查网络、VPN 和访问白名单".into(),
+                ErrorKind::NotFound | ErrorKind::AddrNotAvailable => {
+                    "数据库地址无法解析或不可用，请核对主机名和 DNS".into()
+                }
+                ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::UnexpectedEof
+                | ErrorKind::BrokenPipe => {
+                    let hint = if *tls == TlsMode::VerifyFull {
+                        "；当前开启严格 TLS，请与源连接 SSL 设置核对"
+                    } else {
+                        "；请核对端口、访问白名单和源连接 SSL 设置"
+                    };
+                    format!("数据库连接在握手时被关闭{hint}")
+                }
+                _ => "无法建立数据库网络连接，请检查主机名、端口、VPN 和访问白名单".into(),
+            };
+        }
+        _ => {}
+    }
+    safe_error(error)
 }
 
 /// 功能：仅显示服务端错误码与位置，不回显可能含秘密的 SQL/URL；时间：2026-11-10；作者：lq。
@@ -621,4 +672,32 @@ pub fn csv(result: &ResultSet) -> Vec<u8> {
         output.push_str("\r\n");
     }
     output.into_bytes()
+}
+
+// 功能：回归握手错误分类与诊断脱敏，不发起外部网络请求；时间：2026-11-11；作者：lq。
+#[cfg(test)]
+mod connection_error_tests {
+    use super::*;
+
+    /// 功能：端口拒绝、握手重置和 TLS 错误可区分，底层错误中的密码不回显；时间：2026-11-11；作者：lq。
+    #[test]
+    fn connect_errors_are_actionable_and_do_not_expose_driver_text() {
+        for (kind, expected) in [
+            (std::io::ErrorKind::ConnectionRefused, "拒绝连接"),
+            (std::io::ErrorKind::TimedOut, "超时"),
+            (std::io::ErrorKind::ConnectionReset, "握手时被关闭"),
+            (std::io::ErrorKind::UnexpectedEof, "握手时被关闭"),
+        ] {
+            let error = sqlx::Error::Io(std::io::Error::new(kind, "secret-fixture"));
+            let message = safe_connect_error(error, &TlsMode::VerifyFull);
+            assert!(message.contains(expected));
+            assert!(!message.contains("secret-fixture"));
+        }
+        let message = safe_connect_error(
+            sqlx::Error::Tls("secret-fixture".into()),
+            &TlsMode::VerifyFull,
+        );
+        assert!(message.contains("CA 证书"));
+        assert!(!message.contains("secret-fixture"));
+    }
 }

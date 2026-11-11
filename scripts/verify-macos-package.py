@@ -74,6 +74,9 @@ def run():
             process.wait(timeout=10)
     report["bundle_bytes"] = sum(p.stat().st_size for p in installed.rglob("*") if p.is_file())
     report["archives_bytes"] = {p.name: p.stat().st_size for p in output.iterdir() if p.suffix in (".zip", ".dmg")}
+    # 功能：验收进程结束后移除临时应用副本，只保留诊断和隔离数据；时间：2026-11-11；作者：lq。
+    shutil.rmtree(installed)
+    report["temporary_application_removed"] = True
     (output / "installation-verification.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
     shutil.rmtree(work / "swift-cache", ignore_errors=True)
     print(json.dumps(report, ensure_ascii=False, indent=2))

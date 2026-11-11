@@ -230,18 +230,6 @@ pub fn run_service_ui_smoke() {
     .unwrap();
     settle(&mut cx, handle, &view);
     cx.update_window(handle, |_, window, cx| {
-        let local = first
-            .read(cx)
-            .file_row(false, &files_root.join("项目资源"), cx);
-        window.double_click(local, cx);
-        let remote = first
-            .read(cx)
-            .file_row(true, &remote_root.join("服务器目录"), cx);
-        window.double_click(remote, cx);
-    })
-    .unwrap();
-    settle(&mut cx, handle, &view);
-    cx.update_window(handle, |_, window, cx| {
         let source = first
             .read(cx)
             .file_row(false, &files_root.join("上传说明.txt"), cx);
@@ -297,6 +285,15 @@ pub fn run_service_ui_smoke() {
             .text,
         "{\"name\":\"QDS6\"}\n"
     );
+    // 功能：详情列表只显示当前层级，先进入目录再定位上传后的子目录；时间：2026-11-11；作者：lq。
+    cx.update_window(handle, |_, window, cx| {
+        let row = first
+            .read(cx)
+            .file_row(true, &remote_root.join("服务器目录"), cx);
+        window.double_click(row, cx);
+    })
+    .unwrap();
+    settle(&mut cx, handle, &view);
     cx.update_window(handle, |_, window, cx| {
         let source = first
             .read(cx)
@@ -317,10 +314,6 @@ pub fn run_service_ui_smoke() {
         let source = first
             .read(cx)
             .file_row(false, &files_root.join("按钮上传.txt"), cx);
-        let target = first
-            .read(cx)
-            .file_row(true, &remote_root.join("服务器目录"), cx);
-        window.click(target, cx);
         window.click(source, cx);
         window.click("upload", cx);
     })
@@ -346,15 +339,20 @@ pub fn run_service_ui_smoke() {
         "selected transfer\n"
     );
     assert!(cx.update(|cx| first.read(cx).status.to_string().contains("失败")));
+    // 功能：按钮下载明确传入本地当前目录；时间：2026-11-11；作者：lq。
+    cx.update_window(handle, |_, window, cx| {
+        let target = first
+            .read(cx)
+            .file_row(false, &files_root.join("下载内容"), cx);
+        window.double_click(target, cx);
+    })
+    .unwrap();
+    settle(&mut cx, handle, &view);
     cx.update_window(handle, |_, window, cx| {
         let source =
             first
                 .read(cx)
                 .file_row(true, &remote_root.join("服务器目录/按钮上传.txt"), cx);
-        let target = first
-            .read(cx)
-            .file_row(false, &files_root.join("下载内容"), cx);
-        window.click(target, cx);
         window.click(source, cx);
         window.click("download", cx);
     })
@@ -366,8 +364,8 @@ pub fn run_service_ui_smoke() {
     );
     // 功能：模拟其他远程操作占用任务槽后，以原生拖动验证排队和清空；时间：2026-11-11；作者：lq。
     cx.update_window(handle, |_, window, cx| {
-        let root_row = first.read(cx).file_row(true, &remote_root, cx);
-        window.double_click(root_row, cx);
+        window.click("parent-directory-remote", cx);
+        window.click("parent-directory-local", cx);
         first.update(cx, |server, cx| {
             server.services.busy = true;
             cx.notify();
@@ -453,14 +451,8 @@ pub fn run_service_ui_smoke() {
             .text,
         "双向传输中文验证\n"
     );
-    cx.update_window(handle, |_, window, cx| {
-        let root_row = first.read(cx).file_row(true, &remote_root, cx);
-        window.double_click(root_row, cx);
-    })
-    .unwrap();
-    settle(&mut cx, handle, &view);
     println!(
-        "PASS file trees: native expand, bidirectional file/folder drag, selection upload/download, nested bytes, empty folders, collision keeps target, queue/clear/cancel, blank-pane drop"
+        "PASS file explorer: enter/parent, bidirectional file/folder drag, selection upload/download, nested bytes, empty folders, collision keeps target, queue/clear/cancel, blank-pane drop"
     );
     // 功能：首个 SSH 连接直接展示三面板，两种逻辑视口都重新布局；时间：2026-11-11；作者：lq。
     cx.update_window(handle, |_, window, cx| {
@@ -473,10 +465,14 @@ pub fn run_service_ui_smoke() {
     })
     .unwrap();
     settle(&mut cx, handle, &view);
-    // 功能：截图前恢复树根可见，展示实际层级而非验收滚动停留位置；时间：2026-11-11；作者：lq。
+    // 功能：截图前恢复当前层级首行滚动位置；时间：2026-11-11；作者：lq。
     cx.update(|cx| {
-        first.read(cx).file_row(false, &files_root, cx);
-        first.read(cx).file_row(true, &remote_root, cx);
+        first
+            .read(cx)
+            .file_row(false, &files_root.join("下载内容"), cx);
+        first
+            .read(cx)
+            .file_row(true, &remote_root.join("服务器目录"), cx);
     });
     for (width, height) in [(1440., 900.), (960., 640.)] {
         cx.update_window(handle, |_, window, cx| {
@@ -725,6 +721,7 @@ pub fn run_service_ui_smoke() {
             view.read(cx).status
         );
         assert!(window.try_find("server-workspace").is_none());
+        window.click("database-new-query", cx);
         view.read(cx).sql.clone().update(cx, |editor, cx| {
             editor.set_value(
                 "SELECT '数据库中文' AS text, 9007199254740993::bigint AS exact, NULL AS nullable;",
@@ -773,7 +770,10 @@ pub fn run_service_ui_smoke() {
     })
     .unwrap();
     settle(&mut cx, handle, &view);
-    cx.update(|cx| assert_eq!(view.read(cx).tab, 2));
+    cx.update(|cx| {
+        assert_eq!(view.read(cx).tab, 3);
+        assert!(view.read(cx).services.query_active);
+    });
     cx.update_window(handle, |_, window, cx| {
         window.click("area-servers", cx);
         assert_eq!(view.read(cx).services.active_server, 0);

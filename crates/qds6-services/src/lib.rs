@@ -8,5 +8,7 @@ pub mod migration;
 pub mod sftp;
 pub mod ssh;
 pub mod terminal;
+// 功能：独立后台 SSH 服务器状态采集；时间：2026-11-11；作者：lq。
+pub mod server_status;
 // 功能：仅用户主动操作时查询开源仓库正式发布；时间：2026-11-11；作者：lq。
 pub mod updates;

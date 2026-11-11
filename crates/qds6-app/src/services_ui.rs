@@ -6,13 +6,17 @@ use qds6_core::TlsMode;
 use qds6_services::{
     backup::{self, Configuration},
     credentials::CredentialStore,
-    database::{DatabaseSession, Edit, QueryResult, ResultSet, Table},
+    database::{DatabaseSession, QueryResult, ResultSet, Table},
     sftp,
     ssh::{self, SshError},
     terminal::TerminalSession,
 };
 use std::sync::Arc;
 use zeroize::Zeroizing;
+
+// 功能：平台选择器的路径和取消行为验收；时间：2026-11-11；作者：lq。
+#[cfg(all(test, feature = "ui-tests"))]
+mod private_key_tests;
 
 /// 功能：结果网格真实数据源，Kit 仅绘制可见范围；时间：2026-11-10；作者：lq。
 pub(super) struct QueryRows(ResultSet);
@@ -84,6 +88,8 @@ pub(super) struct ServiceUi {
     pub(super) page: usize,
     pub(super) database: Option<Arc<DatabaseSession>>,
     pub(super) database_identity: String,
+    // 功能：查询栏展示服务端实际数据库及当前模式；时间：2026-11-11；作者：lq。
+    database_context: (String, String),
     // 功能：数据库上下文独立于服务器连接表单；时间：2026-11-11；作者：lq。
     database_profile: Option<ConnectionProfile>,
     results: Option<QueryResult>,
@@ -91,11 +97,17 @@ pub(super) struct ServiceUi {
     selected_result: usize,
     tables: Vec<Table>,
     selected_table: Option<usize>,
-    edit_key_column: Entity<InputState>,
-    edit_key: Entity<InputState>,
+    // 功能：数据库对象页与多表标签独立于 SQL 草稿；时间：2026-11-11；作者：lq。
+    table_tabs: Vec<table_grid::TableTab>,
+    active_table_tab: Option<usize>,
+    object_kind: usize,
+    object_search: Entity<InputState>,
+    catalog_details: bool,
+    // 功能：查询只在用户打开后加入数据库内部标签；时间：2026-11-11；作者：lq。
+    pub(super) query_open: bool,
+    pub(super) query_active: bool,
     edit_column: Entity<InputState>,
     edit_value: Entity<InputState>,
-    edit_null: bool,
     // 功能：默认收起写入工具，为小窗口结果网格保留空间；时间：2026-11-11；作者：lq。
     show_database_tools: bool,
     // 功能：CSV 导出路径独立于 SFTP，本地路径不再跨任务复用；时间：2026-11-11；作者：lq。
@@ -129,6 +141,8 @@ impl ServiceUi {
                 .placeholder("备份口令（至少 8 字符）")
                 .masked(true)
         });
+        // 功能：搜索框修改实时更新对象列表，不在绘制中请求数据库；时间：2026-11-11；作者：lq。
+        let object_search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索表或视图"));
         let backup_subscriptions = [&backup_path, &backup_password]
             .into_iter()
             .map(|input| {
@@ -141,6 +155,8 @@ impl ServiceUi {
                 })
             })
             .collect();
+        let mut backup_subscriptions: Vec<_> = backup_subscriptions;
+        backup_subscriptions.push(cx.observe(&object_search, |_, _, cx| cx.notify()));
         Self {
             busy: false,
             task: None,
@@ -150,18 +166,23 @@ impl ServiceUi {
             page: 0,
             database: None,
             database_identity: String::new(),
+            database_context: (String::new(), String::new()),
             database_profile: None,
             results: None,
             grid: None,
             selected_result: 0,
             tables: Vec::new(),
             selected_table: None,
-            edit_key_column: cx.new(|cx| InputState::new(window, cx).placeholder("主键列名")),
-            edit_key: cx.new(|cx| InputState::new(window, cx).placeholder("主键值")),
             edit_column: cx
-                .new(|cx| InputState::new(window, cx).placeholder("修改列名 / DDL 字段名")),
-            edit_value: cx.new(|cx| InputState::new(window, cx).placeholder("新值 / 新表名称")),
-            edit_null: false,
+                .new(|cx| InputState::new(window, cx).placeholder("新增 / 删除字段名称")),
+            edit_value: cx.new(|cx| InputState::new(window, cx).placeholder("新建 / 重命名表名称")),
+            table_tabs: Vec::new(),
+            active_table_tab: None,
+            object_kind: 0,
+            object_search,
+            catalog_details: false,
+            query_open: false,
+            query_active: false,
             show_database_tools: false,
             show_csv_export: false,
             csv_path: cx.new(|cx| InputState::new(window, cx).placeholder("CSV 保存文件绝对路径")),
@@ -186,12 +207,60 @@ enum Connected {
         profile: ConnectionProfile,
         draft: Option<qds6_services::drafts::Draft>,
         error: Option<String>,
+        // 功能：监控失败不影响终端和文件连接；时间：2026-11-11；作者：lq。
+        monitor: Result<qds6_services::server_status::Monitor, String>,
     },
     Database(DatabaseSession, ConnectionProfile),
     Trust(ConnectionProfile, String, PathBuf),
 }
 
 impl Workbench {
+    /// 功能：原生单文件浏览，捕获当前输入实体避免切换表单后误填其他连接；时间：2026-11-11；作者：lq。
+    fn choose_private_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.saving || self.services.busy {
+            return;
+        }
+        let input = self.form.private_key.clone();
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("选择 SSH 私钥文件".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| match paths.await {
+            Ok(Ok(Some(paths))) => {
+                if let Some(path) = paths.first() {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        if this.form.private_key != input || this.saving || this.services.busy {
+                            return;
+                        }
+                        if let Some(path) = path.to_str() {
+                            input.update(cx, |input, cx| {
+                                input.set_value(path.to_string(), window, cx)
+                            });
+                            this.form_dirty = true;
+                            this.error = false;
+                            this.status = "已选择私钥；如有加密请填写私钥口令".into();
+                        } else {
+                            this.error = true;
+                            this.status = "私钥路径不是有效 UTF-8，请更换文件路径".into();
+                        }
+                        cx.notify();
+                    });
+                }
+            }
+            Ok(Ok(None)) => {}
+            _ => {
+                let _ = this.update(cx, |this, cx| {
+                    this.status = "无法打开文件选择器，请重试或粘贴私钥路径".into();
+                    this.error = true;
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
     /// 功能：统一后台任务边界，失败保留输入和草稿；时间：2026-11-10；作者：lq。
     pub(super) fn service_job<T: Send + 'static>(
         &mut self,
@@ -211,6 +280,13 @@ impl Workbench {
             let result = cx.background_spawn(async move { job() }).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.services.busy = false;
+                // 功能：后台失败也解除网格锁定，保留草稿供用户修正重试；时间：2026-11-11；作者：lq。
+                for tab in &this.services.table_tabs {
+                    tab.grid.update(cx, |grid, cx| {
+                        grid.delegate_mut().locked = false;
+                        cx.notify();
+                    });
+                }
                 match result {
                     Ok(value) => {
                         this.error = false;
@@ -271,18 +347,41 @@ impl Workbench {
             .gap_4()
             .child(self.field("密码 / 私钥口令", &self.form.secret))
             .when(ssh, |v| {
-                v.child(self.field("私钥路径", &self.form.private_key))
-                    .child(
-                        Checkbox::new("use-agent")
-                            .label("使用 SSH Agent")
-                            .checked(self.form.profile.ssh.use_agent)
-                            .disabled(self.saving || self.services.busy)
-                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
-                                this.form.profile.ssh.use_agent = *checked;
-                                this.form_dirty = true;
-                                cx.notify();
-                            })),
-                    )
+                v.child(
+                    v_flex()
+                        .gap_2()
+                        .child(div().text_sm().child("私钥路径"))
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(Input::new(&self.form.private_key)),
+                                )
+                                .child(
+                                    Button::new("browse-private-key")
+                                        .icon(UiIcon::FolderOpen)
+                                        .label("浏览…")
+                                        .disabled(self.saving || self.services.busy)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.choose_private_key(window, cx)
+                                        })),
+                                ),
+                        ),
+                )
+                .child(
+                    Checkbox::new("use-agent")
+                        .label("使用 SSH Agent")
+                        .checked(self.form.profile.ssh.use_agent)
+                        .disabled(self.saving || self.services.busy)
+                        .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                            this.form.profile.ssh.use_agent = *checked;
+                            this.form_dirty = true;
+                            cx.notify();
+                        })),
+                )
             })
             .when(!ssh, |v| {
                 v.child(
@@ -345,6 +444,23 @@ impl Workbench {
                 return;
             }
         };
+        // 功能：同数据库复用会话，切换数据库前要求关闭旧连接以保护事务和草稿；时间：2026-11-11；作者：lq。
+        if matches!(profile.protocol, Protocol::MySql | Protocol::PostgreSql)
+            && self.services.database.is_some()
+        {
+            if self
+                .services
+                .database_profile
+                .as_ref()
+                .is_some_and(|p| p == &profile)
+            {
+                self.activate_workspace(workspace_ui::WorkspaceTarget::Database, cx);
+            } else {
+                self.status = "请先关闭当前数据库连接，再连接其他数据库".into();
+                cx.notify();
+            }
+            return;
+        }
         // 功能：同一连接配置只打开一个服务器工作区，防止多个窗口竞争同一加密草稿；时间：2026-11-11；作者：lq。
         if matches!(profile.protocol, Protocol::Ssh | Protocol::Sftp)
             && let Some(index) = self
@@ -441,9 +557,11 @@ impl Workbench {
                                 .map_err(|e| e.to_string())
                                 .and_then(sftp::Client::new)
                             {
-                                Ok(client) => {
-                                    (Some(terminal), Some(client.with_tunnel(tunnel)), None)
-                                }
+                                Ok(client) => (
+                                    Some(terminal),
+                                    Some(client.with_tunnel(tunnel.clone())),
+                                    None,
+                                ),
                                 Err(error) => (
                                     Some(terminal),
                                     None,
@@ -453,10 +571,14 @@ impl Workbench {
                         } else {
                             (
                                 None,
-                                Some(sftp::Client::new(session)?.with_tunnel(tunnel)),
+                                Some(sftp::Client::new(session)?.with_tunnel(tunnel.clone())),
                                 None,
                             )
                         };
+                        // 功能：采集使用独立认证连接，失败只展示状态错误；时间：2026-11-11；作者：lq。
+                        let monitor = connect().map_err(|e| e.to_string()).map(|session| {
+                            qds6_services::server_status::Monitor::start(session, tunnel.clone())
+                        });
                         let draft = match qds6_services::drafts::load(
                             &path.with_file_name("drafts"),
                             profile.id,
@@ -473,6 +595,7 @@ impl Workbench {
                             profile,
                             draft,
                             error,
+                            monitor,
                         })
                     }
 
@@ -487,6 +610,7 @@ impl Workbench {
                     profile,
                     draft,
                     error,
+                    monitor,
                 } => {
                     let storage = this.storage_path.clone();
                     let server = cx.new(|cx| {
@@ -494,13 +618,16 @@ impl Workbench {
                             profile, terminal, client, storage, window, cx,
                         )
                     });
-                    server.update(cx, |server, cx| server.initialize(draft, error, window, cx));
+                    server.update(cx, |server, cx| {
+                        server.attach_monitor(monitor, cx);
+                        server.initialize(draft, error, window, cx);
+                    });
                     // 功能：新连接继承保存的终端字号；时间：2026-11-11；作者：lq。
                     if let Some(terminal) = server.read(cx).terminal.clone() {
                         terminal.update(cx, |terminal, cx| {
                             terminal
                                 .set_font_size(this.settings.preferences.terminal_font_size, cx);
-                            terminal.set_theme(this.settings.preferences.terminal_theme, cx);
+                            terminal.set_theme(this.resolved_terminal_theme(cx), cx);
                         });
                     }
                     if let Some(terminal) = server.read(cx).terminal.as_ref() {
@@ -521,6 +648,9 @@ impl Workbench {
                     this.area = workspace_ui::WorkspaceArea::Databases;
                     this.services.database = Some(Arc::new(database));
                     this.services.database_identity = name.clone();
+                    this.services.table_tabs.clear();
+                    this.services.active_table_tab = None;
+                    this.services.query_active = false;
                     this.services.tables.clear();
                     this.services.selected_table = None;
                     this.services.results = None;
@@ -528,6 +658,8 @@ impl Workbench {
                     this.services.page = 3;
                     this.tab = 3;
                     this.status = format!("{name} · 数据库已连接").into();
+                    // 功能：连接完成后自动读取对象目录，不执行用户草稿；时间：2026-11-11；作者：lq。
+                    this.load_tables(window, cx);
                 }
                 Connected::Trust(profile, fingerprint, path) => {
                     let text = format!(
@@ -586,10 +718,23 @@ impl Workbench {
                 text.get(range).unwrap_or(&text).to_string()
             }
         });
+        // 功能：结构操作完成后刷新对象列表，查询文本仍保持原样执行；时间：2026-11-11；作者：lq。
+        let refresh_objects = sql.split(|c: char| !c.is_ascii_alphabetic()).any(|word| {
+            ["CREATE", "ALTER", "DROP", "TRUNCATE"]
+                .iter()
+                .any(|w| word.eq_ignore_ascii_case(w))
+        });
         self.service_job(
             "正在执行 SQL…",
-            move || database.query(&sql),
-            |this, result, window, cx| {
+            move || {
+                let result = database.query(&sql)?;
+                let context = database.connection_context().ok();
+                Ok((result, context))
+            },
+            move |this, (result, context), window, cx| {
+                if let Some(context) = context {
+                    this.services.database_context = context;
+                }
                 this.status = format!(
                     "{} 个结果集 · {} ms{}",
                     result.sets.len(),
@@ -609,6 +754,9 @@ impl Workbench {
                 this.services.results = Some(result);
                 this.services.selected_result = 0;
                 // 功能：查询结果留在当前 SQL 编辑区，后台完成不抢走其他标签；时间：2026-11-11；作者：lq。
+                if refresh_objects {
+                    this.load_tables(window, cx);
+                }
             },
             window,
             cx,
@@ -654,17 +802,32 @@ impl Workbench {
         .into_any_element()
     }
 
-    /// 功能：按需刷新数据库对象目录，打开连接不会自动执行用户 SQL；时间：2026-11-10；作者：lq。
+    /// 功能：连接后自动加载及手动刷新数据库对象目录；时间：2026-11-11；作者：lq。
     fn load_tables(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(database) = self.services.database.clone() else {
             return;
         };
         self.service_job(
             "正在读取数据库对象…",
-            move || database.tables(),
-            |this, tables, _, _| {
+            move || {
+                let tables = database.tables()?;
+                let context = database.connection_context()?;
+                Ok((tables, context))
+            },
+            |this, (tables, context), _, _| {
+                this.services.database_context = context;
+                let selected = this
+                    .services
+                    .selected_table
+                    .and_then(|i| this.services.tables.get(i))
+                    .cloned();
                 this.services.tables = tables;
-                this.services.selected_table = None;
+                this.services.selected_table = selected.and_then(|old| {
+                    this.services
+                        .tables
+                        .iter()
+                        .position(|t| t.schema == old.schema && t.name == old.name)
+                });
                 this.status = format!("{} 个数据库对象", this.services.tables.len()).into();
             },
             window,
@@ -672,116 +835,20 @@ impl Workbench {
         );
     }
 
-    /// 功能：选中表的结构/数据按需读取，任意查询结果始终只读；时间：2026-11-10；作者：lq。
+    /// 功能：选中对象打开独立表标签，字段信息在该表详情内显示；时间：2026-11-11；作者：lq。
     fn table_operation(&mut self, structure: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(database) = self.services.database.clone() else {
-            return;
-        };
-        let Some(table) = self
+        if let Some(table) = self
             .services
             .selected_table
             .and_then(|i| self.services.tables.get(i))
             .cloned()
-        else {
-            return;
-        };
-        self.service_job(
-            "正在读取表信息…",
-            move || {
-                if structure {
-                    database.structure(&table)
-                } else {
-                    database.browse(&table)
-                }
-            },
-            |this, result, window, cx| {
-                this.services.grid = result
-                    .sets
-                    .first()
-                    .filter(|s| !s.columns.is_empty())
-                    .map(|set| cx.new(|cx| TableState::new(QueryRows(set.clone()), window, cx)));
-                this.services.results = Some(result);
-                this.services.selected_result = 0;
-                this.status = "表信息已读取；网格修改需在下方填写主键并确认".into();
-            },
-            window,
-            cx,
-        );
-    }
-
-    /// 功能：提交前展示真实表/列/主键，确认后参数绑定并核对一行影响范围；时间：2026-11-10；作者：lq。
-    fn confirm_edit(&mut self, delete: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(database) = self.services.database.clone() else {
-            return;
-        };
-        let Some(table) = self
-            .services
-            .selected_table
-            .and_then(|i| self.services.tables.get(i))
-            .filter(|t| t.kind == "BASE TABLE")
-            .cloned()
-        else {
-            self.status = "请先选择有主键的基础表；任意查询和视图只读".into();
-            cx.notify();
-            return;
-        };
-        let edit = Edit {
-            table,
-            key_column: self.services.edit_key_column.read(cx).value().to_string(),
-            key: self.services.edit_key.read(cx).value().to_string(),
-            column: self.services.edit_column.read(cx).value().to_string(),
-            value: if self.services.edit_null {
-                None
-            } else {
-                Some(self.services.edit_value.read(cx).value().to_string())
-            },
-            delete,
-        };
-        let description = format!(
-            "{}.{}\nWHERE {} = {:?}\n{}\n仅在单列主键精确匹配一行时提交。",
-            edit.table.schema,
-            edit.table.name,
-            edit.key_column,
-            edit.key,
-            if delete {
-                "DELETE 一行".into()
-            } else {
-                format!("SET {} = {:?}", edit.column, edit.value)
-            }
-        );
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            "确认数据库修改？",
-            Some(&description),
-            &["取消", "提交修改"],
-            cx,
-        );
-        cx.spawn_in(window, async move |this, cx| {
-            if answer.await == Ok(1) {
-                let _ = this.update_in(cx, |this, window, cx| {
-                    this.service_job(
-                        "正在提交表数据修改…",
-                        move || database.apply_edit(&edit),
-                        |this, _, window, cx| {
-                            this.status = "一行修改已提交".into();
-                            this.table_operation(false, window, cx);
-                        },
-                        window,
-                        cx,
-                    );
-                });
-            }
-        })
-        .detach();
+        {
+            self.open_table(table, structure, window, cx);
+        }
     }
 
     /// 功能：生成基础 DDL 预览到 Kit 编辑器，用户审阅后显式执行；时间：2026-11-10；作者：lq。
     fn preview_ddl(&mut self, create: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.sql_dirty {
-            self.status = "SQL 草稿有修改，请先复制保存后再生成 DDL".into();
-            cx.notify();
-            return;
-        }
         let Some(profile) = self.services.database_profile.as_ref() else {
             return;
         };
@@ -815,11 +882,7 @@ impl Workbench {
         })();
         match result {
             Ok(sql) => {
-                self.sql
-                    .update(cx, |editor, cx| editor.set_value(sql, window, cx));
-                self.sql_dirty = true;
-                self.tab = 2;
-                self.status = "DDL 已生成，请审阅后点击执行；未自动执行".into();
+                self.show_generated_sql(sql, window, cx);
             }
             Err(error) => {
                 self.status = error.into();
@@ -847,3 +910,9 @@ mod database_ui;
 mod layout_smoke;
 #[cfg(feature = "ui-tests")]
 pub use layout_smoke::run_layout_smoke;
+
+// 功能：原生多表数据网格与独立草稿；时间：2026-11-11；作者：lq。
+mod table_grid;
+// 功能：隔离数据库原生验收入口；时间：2026-11-11；作者：lq。
+#[cfg(feature = "ui-tests")]
+pub use table_grid::smoke::run_database_grid_smoke;

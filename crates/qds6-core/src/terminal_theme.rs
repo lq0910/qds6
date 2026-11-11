@@ -26,6 +26,16 @@ pub struct TerminalPalette {
 }
 
 impl TerminalTheme {
+    /// 功能：按软件亮度解析同系列配色，晴空/深海与暖纸/墨林互为对应；时间：2026-11-11；作者：lq。
+    pub const fn for_appearance(self, dark: bool) -> Self {
+        match (self, dark) {
+            (Self::ClearSky | Self::DeepSea, false) => Self::ClearSky,
+            (Self::ClearSky | Self::DeepSea, true) => Self::DeepSea,
+            (Self::WarmPaper | Self::InkForest, false) => Self::WarmPaper,
+            (Self::WarmPaper | Self::InkForest, true) => Self::InkForest,
+        }
+    }
+
     /// 功能：设置页固定按浅色、深色顺序列出四套主题；时间：2026-11-11；作者：lq。
     pub const ALL: [Self; 4] = [
         Self::ClearSky,
@@ -117,6 +127,21 @@ impl TerminalTheme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 功能：亮度联动保留配色系列，反复切换可恢复原配色；时间：2026-11-11；作者：lq。
+    #[test]
+    fn appearance_pairs_preserve_palette_family() {
+        for theme in TerminalTheme::ALL {
+            assert!(!theme.for_appearance(false).is_dark());
+            assert!(theme.for_appearance(true).is_dark());
+            assert_eq!(
+                theme
+                    .for_appearance(!theme.is_dark())
+                    .for_appearance(theme.is_dark()),
+                theme
+            );
+        }
+    }
 
     /// 功能：验证默认文字、光标和搜索色对比，并固定两浅两深的数量；时间：2026-11-11；作者：lq。
     #[test]

@@ -26,6 +26,13 @@ argon2 = "0.5"
 chacha20poly1305 = "0.10"
 rand = "0.8"
 zeroize = "1"
+# 功能：仅兼容来源密码格式；QDS6 自身备份继续使用现代认证加密；时间：2026-11-11；作者：lq。
+des = { version = "0.8.1", features = ["zeroize"] }
+blowfish = { version = "0.9.1", features = ["zeroize"] }
+aes = { version = "0.8", features = ["zeroize"] }
+cbc = { version = "0.1", features = ["zeroize"] }
+md-5 = "0.10"
+sha1 = "0.10"
 quick-xml = { version = "0.38", features = ["serialize"] }
 # 功能：后台检查 GitHub 正式版本，使用系统根证书和语义版本比较；时间：2026-11-11；作者：lq。
 reqwest = { version = "0.12.28", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }

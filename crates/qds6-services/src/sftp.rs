@@ -25,6 +25,10 @@ pub struct Entry {
     pub permissions: u32,
     pub directory: bool,
     pub symlink: bool,
+    // 功能：保留服务端原始时间和属主编号，缺失属性不伪造；时间：2026-11-11；作者：lq。
+    pub modified: Option<u64>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
 }
 
 /// 功能：远程文本基线保留内容摘要及精确原始字节；时间：2026-11-10；作者：lq。
@@ -126,6 +130,9 @@ impl Client {
                         permissions: stat.perm.unwrap_or(0),
                         directory: stat.is_dir(),
                         symlink: stat.file_type() == ssh2::FileType::Symlink,
+                        modified: stat.mtime,
+                        uid: stat.uid,
+                        gid: stat.gid,
                     });
                 }
                 Err(e) if e.code() == ssh2::ErrorCode::Session(-16) => break,

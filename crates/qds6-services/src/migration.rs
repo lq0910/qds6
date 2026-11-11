@@ -1,10 +1,14 @@
-//! 功能：四类外部连接配置的保守导入预览，不执行来源内容、不解密来源密码；时间：2026-11-10；作者：lq。
+//! 功能：四类连接配置预览及 FinalShell/Navicat 本机密码迁移，确认前不写凭据；时间：2026-11-11；作者：lq。
 
 use crate::backup::{Configuration, MAX_FILE};
-use qds6_core::{ConnectionProfile, Protocol};
+use qds6_core::{ConnectionProfile, Protocol, TlsMode};
 use quick_xml::{Reader, events::Event};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use zeroize::Zeroizing;
+
+// 功能：将旧密码格式兼容限制在独立模块，业务导入只接收临时凭据；时间：2026-11-11；作者：lq。
+mod passwords;
 
 /// 功能：明确用户选择的来源，不根据扩展名猜测加密格式；时间：2026-11-10；作者：lq。
 #[derive(Clone, Copy)]
@@ -21,7 +25,46 @@ pub struct Preview {
     pub warnings: Vec<String>,
 }
 
-/// 功能：限制输入并按来源解析，统一报告秘密和外部文件不迁移；时间：2026-11-10；作者：lq。
+impl Preview {
+    /// 功能：重新导入时复用旧导入器遗漏 Database 的精确稳定 ID，避免新增重复连接；时间：2026-11-11；作者：lq。
+    pub fn reuse_legacy_navicat_ids(&mut self, existing: &[ConnectionProfile]) {
+        let mut updated = 0;
+        let mut ids: std::collections::HashSet<_> =
+            self.config.profiles.iter().map(|p| p.id).collect();
+        for profile in &mut self.config.profiles {
+            if profile.database.is_empty() || existing.iter().any(|p| p.id == profile.id) {
+                continue;
+            }
+            let mut legacy = profile.clone();
+            legacy.database.clear();
+            let legacy_id = imported_id(&legacy);
+            if ids.contains(&legacy_id)
+                || !existing.iter().any(|p| {
+                    let mut original = p.clone();
+                    original.database.clear();
+                    p.id == legacy_id
+                        && (p.database.is_empty() || p.database == profile.database)
+                        && imported_id(&original) == legacy_id
+                })
+            {
+                continue;
+            }
+            if let Some(secret) = self.config.secrets.remove(&profile.id) {
+                self.config.secrets.insert(legacy_id, secret);
+            }
+            profile.id = legacy_id;
+            ids.insert(legacy_id);
+            updated += 1;
+        }
+        if updated > 0 {
+            self.warnings.push(format!(
+                "{updated} 个旧版导入连接将在确认后原位更新数据库配置，不新增重复项。"
+            ));
+        }
+    }
+}
+
+/// 功能：限制输入并按来源解析，兼容密码只留内存，外部文件不自动读取；时间：2026-11-11；作者：lq。
 pub fn preview(source: Source, bytes: &[u8]) -> Result<Preview, String> {
     if bytes.len() > MAX_FILE {
         return Err("导入超过 16 MiB 上限".into());
@@ -45,7 +88,18 @@ pub fn preview(source: Source, bytes: &[u8]) -> Result<Preview, String> {
             .trim_start_matches('\u{feff}')
             .to_string()
     };
-    let mut result = Preview { config: Configuration::new(&[]), warnings: vec!["来源密码和私钥本体不会迁移；导入后请重新输入认证信息。仅支持当前解析字段，非完整版本兼容声明。".into()] };
+    let notice = match source {
+        Source::FinalShell | Source::Navicat => {
+            "已识别的保存密码将随账号一并迁移，确认后写入系统凭据库；无法识别的密码需补填，私钥文件需重新选择。仅支持已验证字段和密码格式。"
+        }
+        _ => {
+            "当前来源仅迁移受支持的连接字段，密码需补填，私钥文件需重新选择。仅支持当前解析字段，非完整版本兼容声明。"
+        }
+    };
+    let mut result = Preview {
+        config: Configuration::new(&[]),
+        warnings: vec![notice.into()],
+    };
     match source {
         Source::Putty => putty(&text, &mut result)?,
         Source::FinalShell => final_shell(&text, &mut result)?,
@@ -77,8 +131,8 @@ pub fn preview(source: Source, bytes: &[u8]) -> Result<Preview, String> {
     Ok(result)
 }
 
-/// 功能：已验证字段构造统一模型，ID 由可映射连接身份确定以保持重复导入幂等；时间：2026-11-10；作者：lq。
-fn add(out: &mut Preview, mut profile: ConnectionProfile) {
+/// 功能：构造稳定连接 ID 并关联临时密码，只保留首条重复连接的配置与认证；时间：2026-11-11；作者：lq。
+fn add(out: &mut Preview, mut profile: ConnectionProfile, secret: Option<Zeroizing<String>>) {
     if out.config.profiles.len() >= 10000 {
         out.warnings.push("超过 10000 项的连接已跳过".into());
         return;
@@ -88,6 +142,23 @@ fn add(out: &mut Preview, mut profile: ConnectionProfile) {
             .push("一项连接缺少有效名称、主机或端口，已跳过".into());
         return;
     }
+    profile.id = imported_id(&profile);
+    // 功能：重复来源保留首条配置及密码，避免后条密码静默覆盖首条认证；时间：2026-11-11；作者：lq。
+    if out.config.profiles.iter().any(|p| p.id == profile.id) {
+        out.warnings
+            .push("重复连接已合并，保留首条连接及其密码状态".into());
+        return;
+    }
+    if let Some(mut secret) = secret {
+        out.config
+            .secrets
+            .insert(profile.id, std::mem::take(&mut *secret));
+    }
+    out.config.profiles.push(profile);
+}
+
+/// 功能：沿用导入连接的稳定身份算法，供旧版 Database 字段修复时精确匹配；时间：2026-11-11；作者：lq。
+fn imported_id(profile: &ConnectionProfile) -> uuid::Uuid {
     let identity = serde_json::to_vec(&(
         profile.protocol,
         &profile.name,
@@ -104,8 +175,7 @@ fn add(out: &mut Preview, mut profile: ConnectionProfile) {
     // 功能：RFC 9562 自定义 UUID v8，仅用于稳定去重，不用作秘密标识；时间：2026-11-10；作者：lq。
     id[6] = (id[6] & 0x0f) | 0x80;
     id[8] = (id[8] & 0x3f) | 0x80;
-    profile.id = uuid::Uuid::from_bytes(id);
-    out.config.profiles.push(profile);
+    uuid::Uuid::from_bytes(id)
 }
 
 /// 功能：读取 PuTTY Sessions .reg 文本，不导入注册表、不执行 LocalCommand/ProxyCommand；时间：2026-11-10；作者：lq。
@@ -176,7 +246,7 @@ fn putty(text: &str, out: &mut Preview) -> Result<(), String> {
             out.warnings
                 .push("PuTTY 会话含未映射选项，未执行任何来源命令".into());
         }
-        add(out, profile);
+        add(out, profile, None);
     }
     Ok(())
 }
@@ -212,12 +282,12 @@ fn percent_decode(text: &str) -> Result<String, String> {
     String::from_utf8(out).map_err(|_| "会话名不是 UTF-8".into())
 }
 
-/// 功能：FinalShell JSON 单项/数组，兼容连接配置字段与无代理标记，保护字段仅报告；时间：2026-11-11；作者：lq。
+/// 功能：FinalShell JSON 连接与已兼容保存密码一并预览，私钥引用仍提示补全；时间：2026-11-11；作者：lq。
 fn final_shell(text: &str, out: &mut Preview) -> Result<(), String> {
     let value: serde_json::Value =
         serde_json::from_str(text).map_err(|_| "FinalShell 文件不是支持的 JSON；不解析加密归档")?;
     let items = value.as_array().cloned().unwrap_or_else(|| vec![value]);
-    for item in items {
+    for (index, item) in items.into_iter().enumerate() {
         let get = |key: &str| {
             item.get(key)
                 .and_then(|v| v.as_str())
@@ -258,17 +328,31 @@ fn final_shell(text: &str, out: &mut Preview) -> Result<(), String> {
                 .and_then(|n| n.try_into().ok())
                 .ok_or("FinalShell 端口无效")?;
         }
-        if item.get("password").is_some() {
-            out.warnings
-                .push("FinalShell 保护密码不可迁移，需要重新输入".into());
-        }
-        if !get("private_key_path").is_empty()
+        let key_auth = !get("private_key_path").is_empty()
             || !get("secret_key_id").is_empty()
-            || item.get("authentication_type").and_then(|v| v.as_u64()) == Some(2)
-        {
+            || item.get("authentication_type").and_then(|v| v.as_u64()) == Some(2);
+        let secret = if key_auth {
             out.warnings
-                .push("FinalShell 私钥需重新选择，本次未读取外部文件".into());
-        }
+                .push(format!("FinalShell 第 {} 项：私钥需重新选择，本次未读取外部文件；密码字段未作为私钥口令迁移", index + 1));
+            None
+        } else if item
+            .get("authentication_type")
+            .is_some_and(|v| v.as_u64() != Some(1))
+        {
+            out.warnings.push(format!(
+                "FinalShell 第 {} 项：认证类型暂不支持，密码需手动补填",
+                index + 1
+            ));
+            None
+        } else {
+            source_password(
+                item.get("password").and_then(|v| v.as_str()),
+                "FinalShell",
+                index + 1,
+                passwords::finalshell,
+                out,
+            )
+        };
         if let Some(object) = item.as_object()
             && object.keys().any(|k| {
                 ![
@@ -291,9 +375,36 @@ fn final_shell(text: &str, out: &mut Preview) -> Result<(), String> {
             out.warnings
                 .push("FinalShell 含未映射字段，已保留可映射的基础连接".into());
         }
-        add(out, profile);
+        add(out, profile, secret);
     }
     Ok(())
+}
+
+/// 功能：逐项报告密码状态，不展示密文或明文，成功值由 Configuration 自动清零；时间：2026-11-11；作者：lq。
+fn source_password(
+    encoded: Option<&str>,
+    source: &str,
+    index: usize,
+    decode: fn(&str) -> Result<passwords::Password, &'static str>,
+    out: &mut Preview,
+) -> Option<Zeroizing<String>> {
+    let Some(encoded) = encoded.filter(|s| !s.is_empty()) else {
+        out.warnings.push(format!(
+            "{source} 第 {index} 项：未提供保存密码，需手动补填"
+        ));
+        return None;
+    };
+    match decode(encoded) {
+        Ok(password) => {
+            out.warnings.push(format!("{source} 第 {index} 项：密码可迁移（{}），确认后写入系统凭据库；旧格式密码需在连接时验证", password.format));
+            Some(password.value)
+        }
+        Err(error) => {
+            out.warnings
+                .push(format!("{source} 第 {index} 项：{error}"));
+            None
+        }
+    }
 }
 
 /// 功能：有界 XML 节点，禁止 DTD 和外部实体，最大深度 64；时间：2026-11-10；作者：lq。
@@ -384,7 +495,7 @@ fn parse_xml(text: &str) -> Result<Node, String> {
     Ok(stack.pop().expect("root"))
 }
 
-/// 功能：FileZilla SFTP 与 Navicat MySQL/Pg 基础字段映射，TLS/隧道未支持项阻断导入；时间：2026-11-10；作者：lq。
+/// 功能：FileZilla SFTP 与 Navicat MySQL/Pg 映射，Navicat 密码本机解码，未支持隧道仍阻断；时间：2026-11-11；作者：lq。
 fn xml_import(text: &str, navicat: bool, out: &mut Preview) -> Result<(), String> {
     let root = parse_xml(text)?;
     fn visit(node: &Node, group: &str, navicat: bool, out: &mut Preview) -> Result<(), String> {
@@ -429,14 +540,43 @@ fn xml_import(text: &str, navicat: bool, out: &mut Preview) -> Result<(), String
             profile.username = node.get(if navicat { "UserName" } else { "User" });
             profile.group = group.into();
             profile.database = node.get("InitialDatabase");
+            // 功能：兼容真实 NCX 的 Database 属性，旧版 InitialDatabase 仍作回退；时间：2026-11-11；作者：lq。
+            if navicat && !node.get("Database").is_empty() {
+                profile.database = node.get("Database");
+            }
             let port = node.get("Port");
             if !port.is_empty() {
                 profile.port = port.parse().map_err(|_| "XML 连接端口无效")?;
             }
             if navicat {
-                out.warnings.push("Navicat 导入默认启用严格 TLS；请核对源连接的证书与隧道设置。未映射字段不会自动执行。".into());
+                // 功能：只在来源明确关闭 SSL 时沿用关闭状态，缺失字段不猜测；时间：2026-11-11；作者：lq。
+                let explicitly_disabled = ["SSL", "UseSSL"].iter().any(|key| {
+                    let value = node.get(key);
+                    value.trim() == "0" || value.trim().eq_ignore_ascii_case("false")
+                });
+                if explicitly_disabled {
+                    profile.db.tls = TlsMode::Disabled;
+                    out.warnings.push(
+                        "Navicat 连接已沿用源文件明确的 SSL=false 设置；数据库 TLS 已关闭。".into(),
+                    );
+                } else {
+                    out.warnings.push(
+                        "Navicat 未提供明确的 SSL 开关，保留严格 TLS；请核对源连接设置。".into(),
+                    );
+                }
             }
-            add(out, profile);
+            let secret = if navicat {
+                source_password(
+                    Some(&node.get("Password")),
+                    "Navicat",
+                    out.config.profiles.len() + 1,
+                    passwords::navicat,
+                    out,
+                )
+            } else {
+                None
+            };
+            add(out, profile, secret);
         }
         let next_group = if node.name == "Folder" {
             let name = node.get("Name");
@@ -460,6 +600,109 @@ fn xml_import(text: &str, navicat: bool, out: &mut Preview) -> Result<(), String
 mod tests {
     use super::*;
 
+    /// 功能：回归 NCX 的关闭 SSL、Database 字段及未知 TLS 不降级；时间：2026-11-11；作者：lq。
+    #[test]
+    fn navicat_preserves_explicit_ssl_and_database_fields() {
+        let xml = b"<Connections><Connection ConnectionName='pg' ConnType='POSTGRESQL' Host='localhost' UserName='login' SSL='false' Database='actual_database'/><Connection ConnectionName='mysql' ConnType='MYSQL' Host='localhost' UseSSL='0'><Database>actual_mysql</Database></Connection><Connection ConnectionName='legacy' ConnType='PostgreSQL' Host='localhost' InitialDatabase='legacy_db'/></Connections>";
+        let result = preview(Source::Navicat, xml).unwrap();
+        let profiles = &result.config.profiles;
+        assert_eq!(profiles[0].db.tls, TlsMode::Disabled);
+        assert_eq!(profiles[0].database, "actual_database");
+        assert_eq!(profiles[1].db.tls, TlsMode::Disabled);
+        assert_eq!(profiles[1].database, "actual_mysql");
+        assert_eq!(profiles[2].db.tls, TlsMode::VerifyFull);
+        assert_eq!(profiles[2].database, "legacy_db");
+        for extra in [
+            "SSL='true'",
+            "SSL='unknown'",
+            "SSL='false' UseSSL='true'",
+            "SSL='false' SSH='true'",
+        ] {
+            let xml = format!(
+                "<Connections><Connection ConnectionName='unsupported' ConnType='MYSQL' Host='localhost' {extra}/></Connections>"
+            );
+            assert!(preview(Source::Navicat, xml.as_bytes()).is_err());
+        }
+    }
+
+    /// 功能：旧版空库名连接合并补全、不重复添加，密码关联随 ID 迁移，手动连接不误匹配；时间：2026-11-11；作者：lq。
+    #[test]
+    fn navicat_reimport_repairs_legacy_identity_without_duplicate_profiles() {
+        let xml = b"<Connections><Connection ConnectionName='pg' ConnType='POSTGRESQL' Host='localhost' UserName='login' SSL='false' Database='actual_database'/></Connections>";
+        let mut result = preview(Source::Navicat, xml).unwrap();
+        let correct_id = result.config.profiles[0].id;
+        let mut legacy = result.config.profiles[0].clone();
+        legacy.database.clear();
+        legacy.db.tls = TlsMode::VerifyFull;
+        legacy.id = imported_id(&legacy);
+        result
+            .config
+            .secrets
+            .insert(correct_id, "public-fixture".into());
+        result.reuse_legacy_navicat_ids(&[legacy.clone()]);
+        assert_eq!(result.config.profiles[0].id, legacy.id);
+        assert_eq!(result.config.profiles[0].database, "actual_database");
+        assert_eq!(
+            result.config.secrets.get(&legacy.id).unwrap(),
+            "public-fixture"
+        );
+        assert!(!result.config.secrets.contains_key(&correct_id));
+        result.config.validate().unwrap();
+
+        let temporary = tempfile::tempdir().unwrap();
+        let mut store =
+            qds6_storage::ProfileStore::open(temporary.path().join("fixture.sqlite3")).unwrap();
+        store.save(&legacy).unwrap();
+        result.config.secrets.clear();
+        result
+            .config
+            .restore(&mut store, &temporary.path().join("before.json"), false)
+            .unwrap();
+        let saved = store.list().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].id, legacy.id);
+        assert_eq!(saved[0].database, "actual_database");
+        assert_eq!(saved[0].db.tls, TlsMode::Disabled);
+        let mut repeated = preview(Source::Navicat, xml).unwrap();
+        repeated.reuse_legacy_navicat_ids(&saved);
+        assert_eq!(repeated.config.profiles[0].id, legacy.id);
+
+        legacy.id = uuid::Uuid::new_v4();
+        let mut manual = preview(Source::Navicat, xml).unwrap();
+        manual.reuse_legacy_navicat_ids(&[legacy]);
+        assert_eq!(manual.config.profiles[0].id, correct_id);
+    }
+
+    /// 功能：显式指定的用户 NCX 只读验收，不输出密码、不写配置或连接业务服务；时间：2026-11-11；作者：lq。
+    #[test]
+    #[ignore = "requires explicitly selected QDS6_NAVICAT_SAMPLE"]
+    fn navicat_selected_sample_preview() {
+        let path = std::env::var_os("QDS6_NAVICAT_SAMPLE").expect("explicit sample path");
+        let bytes = crate::backup::read_bounded(std::path::Path::new(&path)).unwrap();
+        let result = preview(Source::Navicat, &bytes).unwrap();
+        assert_eq!(result.config.profiles.len(), 21);
+        assert_eq!(result.config.secrets.len(), 21);
+        assert!(result.warnings.iter().any(|w| w.contains("SSH/TLS")));
+        assert!(
+            result
+                .config
+                .profiles
+                .iter()
+                .all(|p| p.db.tls == TlsMode::Disabled)
+        );
+        assert!(
+            result
+                .config
+                .profiles
+                .iter()
+                .filter(|p| p.protocol == Protocol::PostgreSql)
+                .all(|p| !p.database.is_empty())
+        );
+        println!(
+            "PASS selected NCX: 21 direct MySQL/PostgreSQL profiles and passwords, explicit SSL=false preserved, PostgreSQL database names present; one SSH tunnel skipped; read-only preview only"
+        );
+    }
+
     /// 功能：复现真实连接配置的无代理标记和密钥引用，基础连接可预览且秘密不落入配置；时间：2026-11-11；作者：lq。
     #[test]
     fn finalshell_connection_config_accepts_no_proxy_and_reports_missing_key() {
@@ -482,7 +725,12 @@ mod tests {
         assert!(profile.credential.is_none());
         assert!(profile.ssh.private_key.is_empty());
         assert!(first.warnings.iter().any(|w| w.contains("私钥需重新选择")));
-        assert!(first.warnings.iter().any(|w| w.contains("密码不可迁移")));
+        assert!(
+            first
+                .warnings
+                .iter()
+                .any(|w| w.contains("未作为私钥口令迁移"))
+        );
         let serialized = serde_json::to_string(&first.config).unwrap();
         assert!(!serialized.contains("opaque-source-password"));
         assert!(!serialized.contains("source-key-reference"));
@@ -566,9 +814,94 @@ mod tests {
                     && p.ssh.private_key.is_empty())
         );
         println!(
-            "FinalShell 只读预览通过：{} 个 SSH 连接；未写入配置或凭据",
-            result.config.profiles.len()
+            "FinalShell 只读预览通过：{} 个 SSH 连接，{} 个密码可迁移；未写入配置或凭据",
+            result.config.profiles.len(),
+            result.config.secrets.len()
         );
+    }
+
+    /// 功能：从 JDK 独立向量选取公开合成密码，不读取外部配置；时间：2026-11-11；作者：lq。
+    fn password_vector(format: &str, plaintext: &str) -> String {
+        let vectors: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("migration/fixtures/passwords.json")).unwrap();
+        vectors
+            .iter()
+            .find(|v| v["format"] == format && v["plaintext"] == plaintext)
+            .unwrap()["encoded"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// 功能：FinalShell 密码关联稳定 ID，预览不产生机器凭据，普通导出阻止带明文秘密；时间：2026-11-11；作者：lq。
+    #[test]
+    fn finalshell_password_is_carried_only_in_transient_credentials() {
+        let encoded = password_vector("finalshell", " 密码 🚀 ");
+        let input = serde_json::json!({"name":"fixture","host":"localhost","user_name":"test","password":encoded,"authentication_type":1});
+        let first = preview(Source::FinalShell, &serde_json::to_vec(&input).unwrap()).unwrap();
+        let profile = &first.config.profiles[0];
+        assert!(profile.credential.is_none());
+        assert!(first.config.secrets[&profile.id] == " 密码 🚀 ");
+        assert!(first.warnings.iter().any(|w| w.contains("密码可迁移")));
+        assert!(!first.warnings.join(" ").contains(" 密码 🚀 "));
+        assert!(crate::backup::encode(&first.config, None).is_err());
+        let export = crate::backup::Configuration::new(&first.config.profiles);
+        assert!(export.secrets.is_empty());
+        let serialized = serde_json::to_string(&export).unwrap();
+        assert!(!serialized.contains(" 密码 🚀 ") && !serialized.contains(&encoded));
+        // 功能：同一连接首条认证获保留，重复和无效配置不留下孤立凭据；时间：2026-11-11；作者：lq。
+        let mut second = input.clone();
+        second["password"] = password_vector("finalshell", "123456").into();
+        let mut invalid = input.clone();
+        invalid["host"] = "".into();
+        let mixed = preview(
+            Source::FinalShell,
+            &serde_json::to_vec(&serde_json::json!([input, second, invalid])).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(mixed.config.profiles.len(), 1);
+        assert_eq!(mixed.config.secrets.len(), 1);
+        assert!(mixed.config.secrets[&profile.id] == " 密码 🚀 ");
+    }
+
+    /// 功能：MySQL/PostgreSQL 的 Navicat 属性或子节点密码均迁移，坏密码保留账号配置并报告；时间：2026-11-11；作者：lq。
+    #[test]
+    fn navicat_database_passwords_support_both_formats_and_partial_failure() {
+        let aes = password_vector("navicat-aes", " 密码 🚀 ");
+        let blowfish = password_vector("navicat-blowfish", "qds6-fixture-only");
+        let xml = format!(
+            "<Connections><Connection ConnectionName='mysql' ConnType='MySQL' Host='localhost' UserName='mysql-user' InitialDatabase='fixture' Password='{blowfish}'/><Connection ConnectionName='pg' ConnType='PostgreSQL' Host='localhost' UserName='pg-user'><Password>{aes}</Password></Connection><Connection ConnectionName='bad-password' ConnType='MySQL' Host='localhost' UserName='saved-user' Password='not-supported'/></Connections>"
+        );
+        let result = preview(Source::Navicat, xml.as_bytes()).unwrap();
+        assert_eq!(result.config.profiles.len(), 3);
+        assert_eq!(result.config.secrets.len(), 2);
+        let mysql = &result.config.profiles[0];
+        let pg = &result.config.profiles[1];
+        assert_eq!(mysql.protocol, Protocol::MySql);
+        assert_eq!(mysql.username, "mysql-user");
+        assert_eq!(mysql.database, "fixture");
+        assert!(result.config.secrets[&mysql.id] == "qds6-fixture-only");
+        assert_eq!(pg.protocol, Protocol::PostgreSql);
+        assert_eq!(pg.username, "pg-user");
+        assert!(result.config.secrets[&pg.id] == " 密码 🚀 ");
+        assert!(
+            result
+                .config
+                .profiles
+                .iter()
+                .all(|p| p.credential.is_none())
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("第 3 项") && w.contains("需手动补填"))
+        );
+        assert!(!result.warnings.join(" ").contains("qds6-fixture-only"));
+        let tunneled = format!(
+            "<Connections><Connection ConnectionName='tunnel' ConnType='MySQL' Host='localhost' UseSSH='true' Password='{blowfish}'/></Connections>"
+        );
+        assert!(preview(Source::Navicat, tunneled.as_bytes()).is_err());
     }
 
     /// 功能：合成脱敏四格式样例、幂等 ID 与恶意 XML 拒绝；不代表源工具全版本验收；时间：2026-11-10；作者：lq。

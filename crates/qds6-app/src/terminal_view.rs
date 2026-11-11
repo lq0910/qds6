@@ -36,6 +36,10 @@ pub struct TerminalView {
 impl TerminalView {
     /// 功能：更新已有网格的主题，保留终端字号、输入焦点和屏幕内容；时间：2026-11-11；作者：lq。
     pub(super) fn set_theme(&mut self, theme: TerminalTheme, cx: &mut Context<Self>) {
+        // 功能：联动同步重复调用时不触发无意义的网格重绘；时间：2026-11-11；作者：lq。
+        if self.theme == theme {
+            return;
+        }
         self.theme = theme;
         self.session
             .model
@@ -248,6 +252,10 @@ impl Render for TerminalView {
                 div()
                     .flex_1()
                     .min_h_0()
+                    // 功能：网格四周留白，PTY 尺寸、绘制和 IME 共用内层画布边界；时间：2026-11-11；作者：lq。
+                    .px_3()
+                    .py_2()
+                    .overflow_hidden()
                     .id("terminal-grid")
                     .test_support()
                     .track_focus(&self.focus)
@@ -267,142 +275,151 @@ impl Render for TerminalView {
                         cx.notify();
                     }))
                     .child(
-                        canvas(
-                            move |bounds, _, cx| {
-                                view.update(cx, |this, _| {
-                                    let columns = (f32::from(bounds.size.width) / (font_size * 0.6))
-                                        .floor()
-                                        .clamp(20., 300.)
-                                        as u16;
-                                    let rows = (f32::from(bounds.size.height) / (font_size * 1.4))
-                                        .floor()
-                                        .clamp(5., 120.)
-                                        as u16;
-                                    if this.columns != columns || this.rows != rows {
-                                        this.columns = columns;
-                                        this.rows = rows;
-                                        this.session.resize(columns, rows);
-                                    }
-                                });
-                                (view.clone(), frame, preedit)
-                            },
-                            move |bounds, (view, frame, preedit), window, cx| {
-                                let focus = view.read(cx).focus.clone();
-                                window.handle_input(
-                                    &focus,
-                                    ElementInputHandler::new(bounds, view.clone()),
-                                    cx,
-                                );
-                                let cell_width = font_size * 0.6;
-                                let cell_height = font_size * 1.4;
-                                for (row, cells) in frame.rows.iter().enumerate() {
-                                    let line_text = cells
-                                        .iter()
-                                        .filter(|c| !c.spacer)
-                                        .map(|c| c.text.as_str())
-                                        .collect::<String>()
-                                        .to_lowercase();
-                                    let matches: Vec<_> = if search.is_empty() {
-                                        Vec::new()
-                                    } else {
-                                        line_text
-                                            .match_indices(search.as_str())
-                                            .map(|(start, text)| start..start + text.len())
-                                            .collect()
-                                    };
-                                    let mut text_offset = 0;
-                                    for (column, cell) in cells.iter().enumerate() {
-                                        if cell.spacer {
-                                            continue;
-                                        }
-                                        let origin = bounds.origin
-                                            + point(
-                                                px(column as f32 * cell_width),
-                                                px(row as f32 * cell_height),
-                                            );
-                                        let width =
-                                            px(cell_width * if cell.wide { 2. } else { 1. });
-                                        // 功能：搜索高亮和光标同步适配浅深色，显式真彩色仍由网格保留；时间：2026-11-11；作者：lq。
-                                        let matched = matches
-                                            .iter()
-                                            .any(|range| range.contains(&text_offset));
-                                        window.paint_quad(fill(
-                                            Bounds {
-                                                origin,
-                                                size: size(width, px(cell_height)),
-                                            },
-                                            rgb(if matched {
-                                                palette.search_background
-                                            } else if cell.cursor {
-                                                palette.cursor
-                                            } else {
-                                                cell.background
-                                            }),
-                                        ));
-                                        let font = font("Menlo");
-                                        let run = TextRun {
-                                            len: cell.text.len(),
-                                            font,
-                                            color: rgb(if matched {
-                                                palette.search_foreground
-                                            } else if cell.cursor {
-                                                palette.cursor_text
-                                            } else {
-                                                cell.foreground
-                                            })
-                                            .into(),
-                                            background_color: None,
-                                            underline: None,
-                                            strikethrough: None,
-                                        };
-                                        let line = window.text_system().shape_line(
-                                            cell.text.clone().into(),
-                                            px(font_size),
-                                            &[run],
-                                            None,
-                                        );
-                                        text_offset += cell.text.to_lowercase().len();
-                                        let _ = line.paint(
-                                            origin,
-                                            px(cell_height),
-                                            TextAlign::Left,
-                                            None,
-                                            window,
+                        div()
+                            .id("terminal-content")
+                            .test_support()
+                            .size_full()
+                            .child(
+                                canvas(
+                                    move |bounds, _, cx| {
+                                        view.update(cx, |this, _| {
+                                            let columns = (f32::from(bounds.size.width)
+                                                / (font_size * 0.6))
+                                                .floor()
+                                                .clamp(20., 300.)
+                                                as u16;
+                                            let rows = (f32::from(bounds.size.height)
+                                                / (font_size * 1.4))
+                                                .floor()
+                                                .clamp(5., 120.)
+                                                as u16;
+                                            if this.columns != columns || this.rows != rows {
+                                                this.columns = columns;
+                                                this.rows = rows;
+                                                this.session.resize(columns, rows);
+                                            }
+                                        });
+                                        (view.clone(), frame, preedit)
+                                    },
+                                    move |bounds, (view, frame, preedit), window, cx| {
+                                        let focus = view.read(cx).focus.clone();
+                                        window.handle_input(
+                                            &focus,
+                                            ElementInputHandler::new(bounds, view.clone()),
                                             cx,
                                         );
-                                    }
-                                }
-                                if !preedit.is_empty() {
-                                    let run = TextRun {
-                                        len: preedit.len(),
-                                        font: font("Menlo"),
-                                        color: rgb(palette.cursor_text).into(),
-                                        background_color: Some(rgb(palette.cursor).into()),
-                                        underline: None,
-                                        strikethrough: None,
-                                    };
-                                    let line = window.text_system().shape_line(
-                                        preedit.into(),
-                                        px(font_size),
-                                        &[run],
-                                        None,
-                                    );
-                                    let _ = line.paint(
-                                        bounds.origin
-                                            + point(
-                                                px(cursor.0 as f32 * cell_width),
-                                                px(cursor.1 as f32 * cell_height),
-                                            ),
-                                        px(cell_height),
-                                        TextAlign::Left,
-                                        None,
-                                        window,
-                                        cx,
-                                    );
-                                }
-                            },
-                        )
-                        .size_full(),
+                                        let cell_width = font_size * 0.6;
+                                        let cell_height = font_size * 1.4;
+                                        for (row, cells) in frame.rows.iter().enumerate() {
+                                            let line_text = cells
+                                                .iter()
+                                                .filter(|c| !c.spacer)
+                                                .map(|c| c.text.as_str())
+                                                .collect::<String>()
+                                                .to_lowercase();
+                                            let matches: Vec<_> = if search.is_empty() {
+                                                Vec::new()
+                                            } else {
+                                                line_text
+                                                    .match_indices(search.as_str())
+                                                    .map(|(start, text)| start..start + text.len())
+                                                    .collect()
+                                            };
+                                            let mut text_offset = 0;
+                                            for (column, cell) in cells.iter().enumerate() {
+                                                if cell.spacer {
+                                                    continue;
+                                                }
+                                                let origin = bounds.origin
+                                                    + point(
+                                                        px(column as f32 * cell_width),
+                                                        px(row as f32 * cell_height),
+                                                    );
+                                                let width =
+                                                    px(cell_width
+                                                        * if cell.wide { 2. } else { 1. });
+                                                // 功能：搜索高亮和光标同步适配浅深色，显式真彩色仍由网格保留；时间：2026-11-11；作者：lq。
+                                                let matched = matches
+                                                    .iter()
+                                                    .any(|range| range.contains(&text_offset));
+                                                window.paint_quad(fill(
+                                                    Bounds {
+                                                        origin,
+                                                        size: size(width, px(cell_height)),
+                                                    },
+                                                    rgb(if matched {
+                                                        palette.search_background
+                                                    } else if cell.cursor {
+                                                        palette.cursor
+                                                    } else {
+                                                        cell.background
+                                                    }),
+                                                ));
+                                                let font = font("Menlo");
+                                                let run = TextRun {
+                                                    len: cell.text.len(),
+                                                    font,
+                                                    color: rgb(if matched {
+                                                        palette.search_foreground
+                                                    } else if cell.cursor {
+                                                        palette.cursor_text
+                                                    } else {
+                                                        cell.foreground
+                                                    })
+                                                    .into(),
+                                                    background_color: None,
+                                                    underline: None,
+                                                    strikethrough: None,
+                                                };
+                                                let line = window.text_system().shape_line(
+                                                    cell.text.clone().into(),
+                                                    px(font_size),
+                                                    &[run],
+                                                    None,
+                                                );
+                                                text_offset += cell.text.to_lowercase().len();
+                                                let _ = line.paint(
+                                                    origin,
+                                                    px(cell_height),
+                                                    TextAlign::Left,
+                                                    None,
+                                                    window,
+                                                    cx,
+                                                );
+                                            }
+                                        }
+                                        if !preedit.is_empty() {
+                                            let run = TextRun {
+                                                len: preedit.len(),
+                                                font: font("Menlo"),
+                                                color: rgb(palette.cursor_text).into(),
+                                                background_color: Some(rgb(palette.cursor).into()),
+                                                underline: None,
+                                                strikethrough: None,
+                                            };
+                                            let line = window.text_system().shape_line(
+                                                preedit.into(),
+                                                px(font_size),
+                                                &[run],
+                                                None,
+                                            );
+                                            let _ = line.paint(
+                                                bounds.origin
+                                                    + point(
+                                                        px(cursor.0 as f32 * cell_width),
+                                                        px(cursor.1 as f32 * cell_height),
+                                                    ),
+                                                px(cell_height),
+                                                TextAlign::Left,
+                                                None,
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    },
+                                )
+                                .size_full(),
+                            ),
                     ),
             )
             .when(self.show_search, |v| {

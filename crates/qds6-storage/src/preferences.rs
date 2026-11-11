@@ -22,6 +22,8 @@ pub struct AppPreferences {
     pub theme: ColorTheme,
     pub terminal_font_size: u8,
     pub terminal_theme: TerminalTheme,
+    // 功能：默认联动软件深浅色，可显式关闭以保留固定终端配色；时间：2026-11-11；作者：lq。
+    pub terminal_follow_appearance: bool,
     pub sql_soft_wrap: bool,
 }
 
@@ -32,6 +34,7 @@ impl Default for AppPreferences {
             theme: ColorTheme::Light,
             terminal_font_size: 14,
             terminal_theme: TerminalTheme::default(),
+            terminal_follow_appearance: true,
             sql_soft_wrap: false,
         }
     }
@@ -144,6 +147,7 @@ mod tests {
             theme: ColorTheme::Dark,
             terminal_font_size: 18,
             terminal_theme: TerminalTheme::WarmPaper,
+            terminal_follow_appearance: false,
             sql_soft_wrap: true,
         };
         store.save_preferences(&preferences).unwrap();
@@ -170,7 +174,7 @@ mod tests {
         )
     }
 
-    /// 功能：升级前的设置缺少终端主题时保持原深色，并覆盖四个选择的序列化；时间：2026-11-11；作者：lq。
+    /// 功能：旧设置保留配色系列并默认联动亮度，四个手动配色仍可序列化；时间：2026-11-11；作者：lq。
     #[test]
     fn terminal_theme_defaults_for_existing_preferences() {
         let old: AppPreferences = serde_json::from_str(
@@ -178,6 +182,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(old.terminal_theme, TerminalTheme::DeepSea);
+        assert!(old.terminal_follow_appearance);
         for theme in TerminalTheme::ALL {
             let preferences = AppPreferences {
                 terminal_theme: theme,

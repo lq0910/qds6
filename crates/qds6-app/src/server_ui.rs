@@ -5,10 +5,16 @@ use gpui_kit::component::resizable::{resizable_panel, v_resizable};
 // 功能：原生双栏树与传输队列；时间：2026-11-11；作者：lq。
 mod files_ui;
 use files_ui::FilesUi;
+// 功能：文件可见性和连接栏回归入口仅在验收构建导出；时间：2026-11-11；作者：lq。
+#[cfg(feature = "ui-tests")]
+pub use files_ui::smoke::run_sidebar_files_smoke;
+// 功能：可收起的实时状态侧栏与独立采样生命周期；时间：2026-11-11；作者：lq。
+pub(crate) mod status_ui;
 use qds6_services::{
     sftp::{self, RemoteDocument},
     terminal::TerminalSession,
 };
+use status_ui::StatusUi;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
@@ -25,6 +31,8 @@ pub(super) struct ServerWorkspace {
     connection_notice: Option<String>,
     storage_path: Option<PathBuf>,
     files_visible: bool,
+    // 功能：监控按服务器隔离，不参与文件任务锁；时间：2026-11-11；作者：lq。
+    monitoring: StatusUi,
 }
 
 /// 功能：文件状态只属于当前服务器实体，切换标签不会复用路径或草稿；时间：2026-11-11；作者：lq。
@@ -116,6 +124,7 @@ impl ServerWorkspace {
             error: false,
             connection_notice: None,
             files_visible: true,
+            monitoring: StatusUi::default(),
         }
     }
 
@@ -427,7 +436,7 @@ impl ServerWorkspace {
                 .as_ref()
                 .and_then(|path| path.parent())
                 .map(PathBuf::from)
-                .unwrap_or_else(|| self.services.files.remote.root.clone())
+                .unwrap_or_else(|| self.services.files.remote.destination())
         } else {
             self.services.files.remote.destination()
         };
@@ -584,6 +593,21 @@ impl Render for ServerWorkspace {
                         self.profile.username, self.profile.host, self.profile.port
                     )))
                     .child(div().flex_1())
+                    .child(
+                        Button::new("toggle-server-status")
+                            .ghost()
+                            .xsmall()
+                            .icon(UiIcon::Server)
+                            .label(if self.monitoring.visible {
+                                "收起状态"
+                            } else {
+                                "服务器状态"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.monitoring.visible = !this.monitoring.visible;
+                                cx.notify();
+                            })),
+                    )
                     .when_some(self.terminal.as_ref(), |v, terminal| {
                         let terminal = terminal.clone();
                         v.child(
@@ -677,28 +701,37 @@ impl Render for ServerWorkspace {
             .size_full()
             .min_h_0()
             .child(
-                div()
+                h_flex()
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
-                    .child(if self.files_visible {
-                        v_resizable("server-vertical-split")
-                            .child(
-                                resizable_panel()
-                                    .size(window.viewport_size().height * 0.43)
-                                    .size_range(px(130.)..Pixels::MAX)
-                                    .child(terminal),
-                            )
-                            .child(
-                                resizable_panel()
-                                    .size(window.viewport_size().height * 0.43)
-                                    .size_range(px(190.)..Pixels::MAX)
-                                    .child(files),
-                            )
-                            .into_any_element()
-                    } else {
-                        terminal.into_any_element()
-                    }),
+                    .when(self.monitoring.visible, |v| {
+                        v.child(self.server_status_panel(cx))
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(if self.files_visible {
+                                v_resizable("server-vertical-split")
+                                    .child(
+                                        resizable_panel()
+                                            .size(window.viewport_size().height * 0.43)
+                                            .size_range(px(130.)..Pixels::MAX)
+                                            .child(terminal),
+                                    )
+                                    .child(
+                                        resizable_panel()
+                                            .size(window.viewport_size().height * 0.43)
+                                            .size_range(px(190.)..Pixels::MAX)
+                                            .child(files),
+                                    )
+                                    .into_any_element()
+                            } else {
+                                terminal.into_any_element()
+                            }),
+                    ),
             )
             .when(
                 !self.files_visible

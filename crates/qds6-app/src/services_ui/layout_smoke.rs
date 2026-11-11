@@ -342,6 +342,99 @@ pub fn run_layout_smoke() {
             assert_eq!(state.profiles.len(), profile_count);
         });
         capture(&mut cx, handle, &format!("finalshell-preview-{tag}"));
+        // 功能：FinalShell 与数据库密码预览的原生布局验收，预览始终不修改正式连接；时间：2026-11-11；作者：lq。
+        let vectors: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../../qds6-services/src/migration/fixtures/passwords.json"
+        ))
+        .unwrap();
+        let encoded = |format: &str| {
+            vectors
+                .iter()
+                .find(|v| v["format"] == format && v["plaintext"] == "qds6-fixture-only")
+                .unwrap()["encoded"]
+                .as_str()
+                .unwrap()
+        };
+        let finalshell = serde_json::to_vec(&serde_json::json!({
+            "name":"SSH 密码迁移","host":"localhost","user_name":"fixture",
+            "authentication_type":1,"conection_type":100,"password":encoded("finalshell")
+        }))
+        .unwrap();
+        let navicat = format!("<Connections><Connection ConnectionName='MySQL 密码迁移' ConnType='MySQL' Host='localhost' UserName='fixture' Password='{}'/><Connection ConnectionName='PostgreSQL 密码迁移' ConnType='PostgreSQL' Host='localhost' UserName='fixture' Password='{}'/></Connections>", encoded("navicat-blowfish"), encoded("navicat-aes")).into_bytes();
+        for (source, label, bytes, count) in
+            [(1, "finalshell", finalshell, 1), (3, "navicat", navicat, 2)]
+        {
+            let path = temporary.join(format!("password-{label}.json"));
+            std::fs::write(&path, bytes).unwrap();
+            cx.update_window(handle, |_, window, cx| {
+                view.update(cx, |state, cx| {
+                    state.services.import_source = source;
+                    state.services.preview = None;
+                    state.services.import_report.clear();
+                    state.services.backup_path.update(cx, |input, cx| {
+                        input.set_value(path.display().to_string(), window, cx)
+                    });
+                    cx.notify();
+                });
+                window.render_frame(cx);
+                window.click("preview-import", cx);
+            })
+            .unwrap();
+            let started = std::time::Instant::now();
+            loop {
+                cx.run_until_parked();
+                if cx.update(|cx| !view.read(cx).services.busy) {
+                    break;
+                }
+                assert!(started.elapsed() < std::time::Duration::from_secs(10));
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            cx.update(|cx| {
+                let state = view.read(cx);
+                assert!(!state.error, "{}", state.status);
+                let preview = state.services.preview.as_ref().unwrap();
+                assert_eq!(preview.profiles.len(), count);
+                assert_eq!(preview.secrets.len(), count);
+                assert!(preview.profiles.iter().all(|p| p.credential.is_none()));
+                assert!(
+                    !state
+                        .services
+                        .import_report
+                        .join(" ")
+                        .contains("qds6-fixture-only")
+                );
+                assert_eq!(state.profiles.len(), profile_count);
+            });
+            capture(&mut cx, handle, &format!("password-import-{label}-{tag}"));
+            // 功能：小窗口滚动后逐条密码报告和确认按钮可访问，不只截取上半页；时间：2026-11-11；作者：lq。
+            cx.update_window(handle, |_, window, cx| {
+                window.scroll(
+                    "preview-import",
+                    ScrollDelta::Pixels(point(px(0.), px(-1200.))),
+                    cx,
+                );
+                window.render_frame(cx);
+                assert!(window.find("confirm-restore").visible());
+                let button = window.find("confirm-restore").bounds();
+                let status = window.find("workspace-status").bounds();
+                assert!(button.bottom() <= status.origin.y);
+                assert!(button.right() <= window.viewport_size().width);
+            })
+            .unwrap();
+            capture(
+                &mut cx,
+                handle,
+                &format!("password-import-{label}-report-{tag}"),
+            );
+            cx.update_window(handle, |_, window, cx| {
+                window.scroll(
+                    "confirm-restore",
+                    ScrollDelta::Pixels(point(px(0.), px(1200.))),
+                    cx,
+                );
+            })
+            .unwrap();
+        }
         cx.update_window(handle, |_, window, cx| {
             view.update(cx, |state, cx| {
                 state.services.backup_mode = 2;

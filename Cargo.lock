@@ -785,6 +785,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "blowfish"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e412e2cd0f2b2d93e02543ceae7917b3c70331573df19ee046bcbc35e45e87d7"
+dependencies = [
+ "byteorder",
+ "cipher",
+]
+
+[[package]]
 name = "borsh"
 version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1518,6 +1528,15 @@ dependencies = [
  "quote",
  "rustc_version",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "des"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffdd80ce8ce993de27e9f063a444a4d53ce8e8db4c1f00cc03af5ad5a9867a1e"
+dependencies = [
+ "cipher",
 ]
 
 [[package]]
@@ -5913,6 +5932,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 name = "qds6-app"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "directories",
  "gpui-kit",
  "qds6-core",
@@ -5937,12 +5957,17 @@ dependencies = [
 name = "qds6-services"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "alacritty_terminal",
  "argon2",
  "base64 0.22.1",
+ "blowfish",
+ "cbc",
  "chacha20poly1305",
+ "des",
  "futures-util",
  "keyring",
+ "md-5",
  "qds6-core",
  "qds6-storage",
  "quick-xml 0.38.4",
@@ -5951,6 +5976,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sha1",
  "sha2 0.10.9",
  "sqlx",
  "ssh2",
