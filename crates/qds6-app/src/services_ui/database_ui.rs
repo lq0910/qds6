@@ -1,6 +1,7 @@
 //! 功能：数据库对象、SQL 与结果同屏组织，低频写入和导出按需展开；时间：2026-11-11；作者：lq。
 
 use super::*;
+use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
 
 impl Workbench {
     /// 功能：SQL 页面只在查询后分配结果区，空闲时保留完整编辑空间；时间：2026-11-11；作者：lq。
@@ -140,6 +141,19 @@ impl Workbench {
                             }))
                     }),
             )
+            // 功能：新建表独立入口，已选中其他对象时仍能创建；时间：2026-11-12；作者：lq。
+            .child(
+                Button::new("database-new-table")
+                    .small()
+                    .ghost()
+                    .icon(UiIcon::Plus)
+                    .label("新建表")
+                    .disabled(!connected || self.services.busy)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.services.show_database_tools = !this.services.show_database_tools;
+                        cx.notify();
+                    })),
+            )
             .child(
                 Button::new("database-design")
                     .small()
@@ -147,8 +161,15 @@ impl Workbench {
                     .icon(UiIcon::Settings)
                     .label("表设计")
                     .disabled(!connected)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.services.show_database_tools = !this.services.show_database_tools;
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        if let Some(index) = this.services.active_table_tab {
+                            this.services.table_tabs[index].designing =
+                                !this.services.table_tabs[index].designing;
+                        } else if this.services.selected_table.is_some() {
+                            this.table_operation(true, window, cx);
+                        } else {
+                            this.services.show_database_tools = !this.services.show_database_tools;
+                        }
                         cx.notify();
                     })),
             )
@@ -178,7 +199,9 @@ impl Workbench {
             .id("database-object-pane")
             .test_support()
             .size_full()
+            .min_w_0()
             .min_h_0()
+            .overflow_hidden()
             .child(
                 h_flex()
                     .h(px(40.))
@@ -221,6 +244,7 @@ impl Workbench {
                                 h_flex()
                                     .id(("database-object", index))
                                     .test_support()
+                                    .flex_shrink_0()
                                     .p_2()
                                     .gap_2()
                                     .items_center()
@@ -276,14 +300,45 @@ impl Workbench {
                     })),
             );
         for (index, tab) in self.services.table_tabs.iter().enumerate() {
-            let dirty = !tab.grid.read(cx).delegate().changes().is_empty();
+            let dirty = tab.has_changes(cx);
+            let menu_view = cx.entity();
+            let anchor = tab.grid.clone();
             tabs = tabs.child(
+                // 功能：保留标签名称元数据供溢出菜单和无障碍检索，右键命中整个标签；时间：2026-11-12；作者：lq。
                 Tab::new()
+                    .relative()
                     .label(format!(
-                        "{}{}",
+                        "{}{}{}",
                         tab.table.name,
+                        if tab.designing { " · 设计" } else { "" },
                         if dirty { " •" } else { "" }
                     ))
+                    .child(
+                        h_flex()
+                            .id(("table-tab-label", index))
+                            .test_support()
+                            .absolute()
+                            .inset_0()
+                            .context_menu(move |mut menu, _, _| {
+                                for (mode, label) in [
+                                    (0, "关闭"),
+                                    (1, "关闭其他选项卡"),
+                                    (2, "关闭右侧选项卡"),
+                                    (3, "全部关闭"),
+                                ] {
+                                    let view = menu_view.clone();
+                                    let anchor = anchor.clone();
+                                    menu = menu.item(PopupMenuItem::new(label).on_click(
+                                        move |_, window, cx| {
+                                            view.update(cx, |this, cx| {
+                                                this.close_table_tabs(&anchor, mode, window, cx)
+                                            });
+                                        },
+                                    ));
+                                }
+                                menu
+                            }),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.activate_table_tab(index, cx);
                     }))
@@ -322,28 +377,29 @@ impl Workbench {
                     ),
             );
         }
+        // 功能：工作区及对象列表限制绘制边界，滚动内容不覆盖标签与工具栏；时间：2026-11-12；作者：lq。
         let center = v_flex()
             .id("database-table-workspace")
             .test_support()
             .size_full()
             .min_h_0()
             .min_w_0()
-            .child(tabs)
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .child(if self.services.query_active {
-                        self.database_query_panel(cx).into_any_element()
-                    } else if let Some(index) = self.services.active_table_tab {
-                        self.table_data_panel(index, cx).into_any_element()
-                    } else {
-                        self.database_catalog(cx).into_any_element()
-                    }),
-            );
+            .overflow_hidden()
+            .child(div().flex_shrink_0().min_w_0().child(tabs))
+            .child(div().flex_1().min_h_0().min_w_0().overflow_hidden().child(
+                if self.services.query_active {
+                    self.database_query_panel(cx).into_any_element()
+                } else if let Some(index) = self.services.active_table_tab {
+                    self.table_data_panel(index, cx).into_any_element()
+                } else {
+                    self.database_catalog(cx).into_any_element()
+                },
+            ));
         v_flex()
             .size_full()
+            .min_w_0()
             .min_h_0()
+            .overflow_hidden()
             .child(toolbar)
             .when(self.services.show_database_tools, |v| {
                 v.child(self.database_write_tools(cx))
@@ -416,17 +472,17 @@ impl Workbench {
             .services
             .selected_table
             .and_then(|i| self.services.tables.get(i));
-        v_flex().size_full().min_h_0()
-            .child(h_flex().p_2().gap_2().items_center().border_b_1().border_color(cx.theme().border)
+        v_flex().size_full().min_w_0().min_h_0().overflow_hidden()
+            .child(h_flex().flex_shrink_0().p_2().gap_2().items_center().border_b_1().border_color(cx.theme().border)
                 .child(Button::new("browse-table").small().ghost().icon(UiIcon::FolderOpen).label("打开表").disabled(self.services.busy || selected.is_none()).on_click(cx.listener(|this, _, window, cx| this.table_operation(false, window, cx))))
                 .child(Button::new("table-structure").small().ghost().icon(UiIcon::Settings).label("设计表").disabled(selected.is_none()).on_click(cx.listener(|this, _, window, cx| this.table_operation(true, window, cx))))
                 .child(div().flex_1())
                 .child(Button::new("catalog-details").small().ghost().label("表详情").selected(self.services.catalog_details).on_click(cx.listener(|this, _, _, cx| { this.services.catalog_details = !this.services.catalog_details; cx.notify(); }))))
-            .child(h_flex().flex_1().min_h_0()
+            .child(h_flex().flex_1().min_w_0().min_h_0().overflow_hidden()
                 .child(v_flex().id("database-catalog").test_support().flex_1().min_w_0().min_h_0().overflow_y_scroll()
-                    .child(h_flex().p_2().gap_3().border_b_1().border_color(cx.theme().border).child(div().flex_1().text_xs().font_semibold().child("名称")).child(div().w(px(150.)).text_xs().child("模式")).child(div().w(px(100.)).text_xs().child("类型")))
+                    .child(h_flex().flex_shrink_0().p_2().gap_3().border_b_1().border_color(cx.theme().border).child(div().flex_1().text_xs().font_semibold().child("名称")).child(div().w(px(150.)).text_xs().child("模式")).child(div().w(px(100.)).text_xs().child("类型")))
                     .children(self.services.tables.iter().enumerate().filter(|(_, t)| self.object_matches(t, cx)).map(|(index, table)| {
-                        h_flex().id(("catalog-object", index)).test_support().p_2().gap_3().cursor_pointer().border_b_1().border_color(cx.theme().border)
+                        h_flex().id(("catalog-object", index)).test_support().flex_shrink_0().p_2().gap_3().cursor_pointer().border_b_1().border_color(cx.theme().border)
                             .when(self.services.selected_table == Some(index), |v| v.bg(cx.theme().secondary))
                             .hover(|v| v.bg(cx.theme().secondary)).child(Icon::new(UiIcon::Table2).xsmall())
                             .child(div().flex_1().min_w_0().text_xs().text_ellipsis().child(table.name.clone()))
@@ -548,11 +604,7 @@ impl Workbench {
         if self.services.busy || self.services.database.is_none() {
             return;
         }
-        let dirty = self
-            .services
-            .table_tabs
-            .iter()
-            .any(|t| !t.grid.read(cx).delegate().changes().is_empty());
+        let dirty = self.services.table_tabs.iter().any(|t| t.has_changes(cx));
         let answer = window.prompt(
             PromptLevel::Warning,
             "关闭数据库连接？",

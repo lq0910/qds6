@@ -7,6 +7,11 @@ use sqlx::QueryBuilder;
 pub struct GridColumn {
     pub name: String,
     pub data_type: String,
+    // 功能：保留数据库字段注释，供数据表头与设计器显示；时间：2026-11-12；作者：lq。
+    pub comment: String,
+    // 功能：MySQL 完整定义保留排序规则和额外属性，避免修改备注时重置；时间：2026-11-12；作者：lq。
+    pub collation: Option<String>,
+    pub extra: String,
     pub nullable: bool,
     pub default: Option<String>,
     pub generated: bool,
@@ -19,7 +24,67 @@ pub struct GridColumn {
 #[derive(Clone, Default)]
 pub struct BrowseRequest {
     pub page: usize,
-    pub filter: Option<(String, String)>,
+    pub filters: Vec<GridFilter>,
+    pub match_any: bool,
+    pub order: Vec<(String, bool)>,
+}
+/// 功能：结构化筛选运算符，SQL 片段仅来自封闭枚举；时间：2026-11-12；作者：lq。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FilterOp {
+    #[default]
+    Contains,
+    Equal,
+    NotEqual,
+    Greater,
+    GreaterEqual,
+    Less,
+    LessEqual,
+    StartsWith,
+    EndsWith,
+    IsNull,
+    IsNotNull,
+}
+impl FilterOp {
+    pub const ALL: [Self; 11] = [
+        Self::Contains,
+        Self::Equal,
+        Self::NotEqual,
+        Self::Greater,
+        Self::GreaterEqual,
+        Self::Less,
+        Self::LessEqual,
+        Self::StartsWith,
+        Self::EndsWith,
+        Self::IsNull,
+        Self::IsNotNull,
+    ];
+    /// 功能：界面和查询共用明确的筛选含义；时间：2026-11-12；作者：lq。
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Contains => "包含",
+            Self::Equal => "等于",
+            Self::NotEqual => "不等于",
+            Self::Greater => "大于",
+            Self::GreaterEqual => "大于等于",
+            Self::Less => "小于",
+            Self::LessEqual => "小于等于",
+            Self::StartsWith => "开头是",
+            Self::EndsWith => "结尾是",
+            Self::IsNull => "为 NULL",
+            Self::IsNotNull => "非 NULL",
+        }
+    }
+    /// 功能：NULL 判断禁用输入但保留输入草稿；时间：2026-11-12；作者：lq。
+    pub fn needs_value(self) -> bool {
+        !matches!(self, Self::IsNull | Self::IsNotNull)
+    }
+}
+/// 功能：字段和值分别校验及绑定，空字符串可作为精确筛选值；时间：2026-11-12；作者：lq。
+#[derive(Clone)]
+pub struct GridFilter {
+    pub column: String,
+    pub op: FilterOp,
+    pub value: String,
 }
 pub const PAGE_SIZE: usize = 200;
 
@@ -71,11 +136,11 @@ impl DatabaseSession {
         let name = literal(&table.name);
         let sql = if self.profile.protocol == Protocol::PostgreSql {
             format!(
-                "SELECT c.column_name, c.data_type, c.is_nullable, c.column_default, c.is_generated, c.is_identity, c.udt_schema, c.udt_name, CASE WHEN EXISTS (SELECT 1 FROM information_schema.table_constraints t JOIN information_schema.key_column_usage k ON t.constraint_catalog=k.constraint_catalog AND t.constraint_schema=k.constraint_schema AND t.constraint_name=k.constraint_name AND t.table_name=k.table_name WHERE t.constraint_type='PRIMARY KEY' AND t.table_schema=c.table_schema AND t.table_name=c.table_name AND k.column_name=c.column_name) THEN 'YES' ELSE 'NO' END FROM information_schema.columns c WHERE c.table_schema={schema} AND c.table_name={name} ORDER BY c.ordinal_position"
+                "SELECT c.column_name, pg_catalog.format_type(a.atttypid,a.atttypmod), c.is_nullable, c.column_default, c.is_generated, c.is_identity, c.udt_schema, c.udt_name, CASE WHEN EXISTS (SELECT 1 FROM information_schema.table_constraints t JOIN information_schema.key_column_usage k ON t.constraint_catalog=k.constraint_catalog AND t.constraint_schema=k.constraint_schema AND t.constraint_name=k.constraint_name AND t.table_name=k.table_name WHERE t.constraint_type='PRIMARY KEY' AND t.table_schema=c.table_schema AND t.table_name=c.table_name AND k.column_name=c.column_name) THEN 'YES' ELSE 'NO' END, COALESCE(pg_catalog.col_description(cl.oid, a.attnum), '') FROM information_schema.columns c JOIN pg_catalog.pg_namespace ns ON ns.nspname=c.table_schema JOIN pg_catalog.pg_class cl ON cl.relnamespace=ns.oid AND cl.relname=c.table_name JOIN pg_catalog.pg_attribute a ON a.attrelid=cl.oid AND a.attname=c.column_name AND a.attnum>0 AND NOT a.attisdropped WHERE c.table_schema={schema} AND c.table_name={name} ORDER BY c.ordinal_position"
             )
         } else {
             format!(
-                "SELECT column_name, data_type, is_nullable, column_default, extra, column_key FROM information_schema.columns WHERE table_schema={schema} AND table_name={name} ORDER BY ordinal_position"
+                "SELECT column_name, column_type, is_nullable, column_default, extra, column_key, column_comment, collation_name FROM information_schema.columns WHERE table_schema={schema} AND table_name={name} ORDER BY ordinal_position"
             )
         };
         let result = self.query(&sql)?;
@@ -91,7 +156,8 @@ impl DatabaseSession {
             let generated = if pg {
                 text(4) == "ALWAYS" || text(5) == "YES"
             } else {
-                text(4).contains("GENERATED")
+                text(4).contains("GENERATED") && !text(4).contains("DEFAULT_GENERATED")
+                    || text(4).contains("auto_increment")
             };
             let writable = if pg {
                 [
@@ -125,16 +191,31 @@ impl DatabaseSession {
                     "geometry",
                     "bit",
                 ]
-                .contains(&data_type.as_str())
+                .contains(&data_type.split('(').next().unwrap_or(&data_type))
             } && !generated;
             columns.push(GridColumn {
                 name: text(0),
                 data_type,
+                comment: text(if pg { 9 } else { 6 }),
+                collation: if pg || row[7] == Cell::Null {
+                    None
+                } else {
+                    Some(text(7))
+                },
+                extra: if pg {
+                    String::new()
+                } else {
+                    text(4).replace("DEFAULT_GENERATED", "").trim().to_string()
+                },
                 nullable: text(2) == "YES",
                 default: if row[3] == Cell::Null {
                     None
                 } else {
-                    Some(text(3))
+                    Some(if !pg && !text(4).contains("DEFAULT_GENERATED") {
+                        format!("'{}'", text(3).replace('\\', "\\\\").replace('\'', "''"))
+                    } else {
+                        text(3)
+                    })
                 },
                 generated,
                 primary: if pg {
@@ -191,14 +272,44 @@ impl DatabaseSession {
             macro_rules! fetch {
                 ($db:ty, $conn:expr, $decode:ident, $text_type:expr) => {{
                     let mut query = QueryBuilder::<$db>::new(format!("SELECT * FROM {qualified}"));
-                    if let Some((column, value)) = &request.filter {
-                        if !columns.iter().any(|c| c.name == *column) { return Err("筛选字段不存在".into()); }
-                        query.push(format!(" WHERE CAST({} AS {}) LIKE ", identifier(protocol, column)?, $text_type));
-                        query.push_bind(format!("%{}%", value.replace('!', "!!").replace('%', "!%").replace('_', "!_")));
-                        query.push(" ESCAPE '!' ");
+                    // 功能：多条件绑定、原生类型比较和稳定多列排序；时间：2026-11-12；作者：lq。
+                    if request.filters.len() > 32 || request.order.len() > 16 { return Err("筛选或排序条件过多".into()); }
+                    for (i, filter) in request.filters.iter().enumerate() {
+                        let column = columns.iter().find(|c| c.name == filter.column).ok_or("筛选字段不存在")?;
+                        query.push(if i == 0 { " WHERE (" } else if request.match_any { " OR " } else { " AND " });
+                        let field = identifier(protocol, &column.name)?;
+                        match filter.op {
+                            FilterOp::IsNull => { query.push(format!("{field} IS NULL")); }
+                            FilterOp::IsNotNull => { query.push(format!("{field} IS NOT NULL")); }
+                            FilterOp::Contains | FilterOp::StartsWith | FilterOp::EndsWith => {
+                                query.push(format!("CAST({field} AS {}) LIKE ", $text_type));
+                                let escaped = filter.value.replace('!', "!!").replace('%', "!%").replace('_', "!_");
+                                query.push_bind(match filter.op {
+                                    FilterOp::StartsWith => format!("{escaped}%"),
+                                    FilterOp::EndsWith => format!("%{escaped}"),
+                                    _ => format!("%{escaped}%"),
+                                });
+                                query.push(" ESCAPE '!' ");
+                            }
+                            op => {
+                                let operator = match op { FilterOp::Equal => "=", FilterOp::NotEqual => "<>", FilterOp::Greater => ">", FilterOp::GreaterEqual => ">=", FilterOp::Less => "<", _ => "<=" };
+                                query.push(format!("{field} {operator} "));
+                                if protocol == Protocol::PostgreSql { query.push("CAST("); }
+                                query.push_bind(filter.value.clone());
+                                if protocol == Protocol::PostgreSql { query.push(format!(" AS {})", column.cast)); }
+                            }
+                        }
                     }
-                    let keys: Vec<_> = columns.iter().filter(|c| c.primary).map(|c| identifier(protocol, &c.name)).collect::<Result<_, _>>()?;
-                    if !keys.is_empty() { query.push(format!(" ORDER BY {}", keys.join(", "))); }
+                    if !request.filters.is_empty() { query.push(")"); }
+                    let mut order = Vec::new();
+                    for (field, descending) in &request.order {
+                        if !columns.iter().any(|c| c.name == *field) { return Err("排序字段不存在".into()); }
+                        order.push(format!("{} {}", identifier(protocol, field)?, if *descending { "DESC" } else { "ASC" }));
+                    }
+                    for key in columns.iter().filter(|c| c.primary && !request.order.iter().any(|(n, _)| *n == c.name)) {
+                        order.push(identifier(protocol, &key.name)?);
+                    }
+                    if !order.is_empty() { query.push(format!(" ORDER BY {}", order.join(", "))); }
                     query.push(format!(" LIMIT {} OFFSET {}", PAGE_SIZE + 1, request.page.saturating_mul(PAGE_SIZE)));
                     let sql = query.sql().to_string();
                     let rows = query.build().fetch_all($conn).await.map_err(safe_error)?;

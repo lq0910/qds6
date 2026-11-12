@@ -1,11 +1,15 @@
 //! 功能：多表独立草稿、原生单元格编辑与分页工具栏；时间：2026-11-11；作者：lq。
 use super::*;
+use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 use gpui_kit::component::{
     menu::{DropdownMenu, PopupMenuItem},
     table::TableEvent,
 };
 use qds6_services::database::{BrowseRequest, Cell, PAGE_SIZE, RowChange, TablePage};
 use std::collections::BTreeSet;
+// 功能：筛选、设计器按表标签独立保存；时间：2026-11-12；作者：lq。
+mod design;
+mod filters;
 
 /// 功能：原记录和变更分离，未填写的新行字段保留数据库默认值；时间：2026-11-11；作者：lq。
 #[derive(Clone)]
@@ -20,11 +24,22 @@ pub(super) struct TableTab {
     pub table: Table,
     pub grid: Entity<TableState<TableRows>>,
     pub request: BrowseRequest,
-    pub filter: Entity<InputState>,
-    pub filter_column: usize,
+    filters: Vec<filters::FilterDraft>,
+    order: Vec<(usize, bool)>,
+    match_any: bool,
+    filter_expanded: bool,
+    design: design::TableDesign,
+    pub designing: bool,
     pub details: bool,
     pub fields: bool,
     _subscriptions: Vec<Subscription>,
+}
+
+impl TableTab {
+    /// 功能：数据与结构草稿统一参与关闭确认和标签提示；时间：2026-11-12；作者：lq。
+    pub(super) fn has_changes(&self, cx: &App) -> bool {
+        !self.grid.read(cx).delegate().changes().is_empty() || self.design.dirty(cx)
+    }
 }
 
 /// 功能：只对真实基础表启用写入，虚拟网格维持稳定行索引；时间：2026-11-11；作者：lq。
@@ -115,20 +130,49 @@ impl TableDelegate for TableRows {
             .width(px(180.))
             .min_width(px(70.))
     }
-    /// 功能：列头显示主键和真实字段类型；时间：2026-11-11；作者：lq。
+    /// 功能：三行表头展示名称、类型及真实备注，截断文本可悬停查看；时间：2026-11-12；作者：lq。
     fn render_th(
         &mut self,
         col: usize,
         _: &mut Window,
-        _: &mut Context<TableState<Self>>,
+        cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let c = &self.page.columns[self.column_index(col)];
-        div().child(format!(
-            "{}{} · {}",
-            if c.primary { "PK · " } else { "" },
-            c.name,
-            c.data_type
-        ))
+        let tooltip = format!("{} · {}\n{}", c.name, c.data_type, c.comment);
+        v_flex()
+            .id(SharedString::from(format!(
+                "grid-header-{}",
+                self.column_index(col)
+            )))
+            .test_support()
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .text_xs()
+            .child(div().text_ellipsis().font_semibold().child(format!(
+                "{}{}",
+                if c.primary { "PK · " } else { "" },
+                c.name
+            )))
+            .child(
+                div()
+                    .text_ellipsis()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(c.data_type.clone()),
+            )
+            .child(
+                div()
+                    .text_ellipsis()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(if c.comment.is_empty() {
+                        "—".into()
+                    } else {
+                        c.comment.clone()
+                    }),
+            )
+            .tooltip(move |window, cx| {
+                gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx)
+            })
     }
     /// 功能：编辑器直接嵌入结果单元格，修改和删除行保留可视标记；时间：2026-11-11；作者：lq。
     fn render_td(
@@ -141,10 +185,19 @@ impl TableDelegate for TableRows {
         let col = self.column_index(col);
         let edited = self.rows[row].values[col].is_some() || self.rows[row].original.is_none();
         let deleted = self.rows[row].deleted;
+        // 功能：长文本与 JSON 可悬停查看完整内容，编辑入口仍为双击；时间：2026-11-12；作者：lq。
+        let tooltip = self
+            .value(row, col)
+            .map(|v| v.display())
+            .unwrap_or_else(|| "DEFAULT".into());
         div()
             .id(SharedString::from(format!("grid-cell-{row}-{col}")))
             .test_support()
             .size_full()
+            .overflow_hidden()
+            .tooltip(move |window, cx| {
+                gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx)
+            })
             .when(deleted, |v| v.opacity(0.4))
             .when(edited, |v| v.bg(cx.theme().secondary))
             .on_key_down(cx.listener(|state, event: &KeyDownEvent, window, cx| {
@@ -172,6 +225,7 @@ impl TableDelegate for TableRows {
                 } else {
                     div()
                         .text_xs()
+                        .text_ellipsis()
                         .child(format!(
                             "{}{}",
                             if deleted {
@@ -278,8 +332,7 @@ impl Workbench {
         {
             self.services.active_table_tab = Some(index);
             if structure {
-                self.services.table_tabs[index].details = true;
-                self.services.show_database_tools = true;
+                self.services.table_tabs[index].designing = true;
             }
             self.services.query_active = false;
             cx.notify();
@@ -293,31 +346,49 @@ impl Workbench {
             "正在打开表…",
             move || database.browse_page(&target, &BrowseRequest::default()),
             move |this, page, window, cx| {
+                let design = design::TableDesign::new(&page.columns, window, cx);
                 let grid = cx.new(|cx| {
                     TableState::new(TableRows::new(page), window, cx).cell_selectable(true)
                 });
-                let events =
-                    cx.subscribe_in(&grid, window, |_, grid, event: &TableEvent, window, cx| {
+                let events = cx.subscribe_in(
+                    &grid,
+                    window,
+                    |this, grid, event: &TableEvent, window, cx| {
                         if let TableEvent::DoubleClickedCell(row, col) = event {
+                            // 功能：结构草稿尚未执行时禁止混入数据编辑，避免保存后刷新覆盖结构草稿；时间：2026-11-12；作者：lq。
+                            if this
+                                .services
+                                .table_tabs
+                                .iter()
+                                .any(|tab| &tab.grid == grid && tab.design.dirty(cx))
+                            {
+                                this.status =
+                                    "请先执行结构变更并撤销草稿后刷新，或撤销结构修改，再编辑数据"
+                                        .into();
+                                cx.notify();
+                                return;
+                            }
                             Self::edit_grid_cell(grid, *row, *col, window, cx);
                         }
-                    });
+                    },
+                );
                 let observe = cx.observe(&grid, |_, _, cx| cx.notify());
-                let filter =
-                    cx.new(|cx| InputState::new(window, cx).placeholder("输入字段包含的文字"));
+                let filter = filters::FilterDraft::new(window, cx);
                 this.services.table_tabs.push(TableTab {
                     table,
                     grid,
                     request: BrowseRequest::default(),
-                    filter,
-                    filter_column: 0,
-                    details: structure,
+                    filters: vec![filter],
+                    order: Vec::new(),
+                    match_any: false,
+                    filter_expanded: false,
+                    design,
+                    designing: structure,
+                    details: false,
                     fields: false,
                     _subscriptions: vec![events, observe],
                 });
-                if structure {
-                    this.services.show_database_tools = true;
-                }
+
                 this.services.active_table_tab = Some(this.services.table_tabs.len() - 1);
                 this.services.query_active = false;
                 this.status = "双击单元格编辑 · 底部保存或取消修改".into();
@@ -338,8 +409,8 @@ impl Workbench {
             return;
         };
         let tab = &self.services.table_tabs[index];
-        if !tab.grid.read(cx).delegate().changes().is_empty() {
-            self.status = "请先保存或取消当前表修改，再刷新、筛选或翻页".into();
+        if tab.has_changes(cx) {
+            self.status = "请先保存或撤销当前表的数据与结构修改，再刷新、筛选或翻页".into();
             cx.notify();
             return;
         }
@@ -351,16 +422,49 @@ impl Workbench {
         self.service_job(
             "正在读取表数据…",
             move || database.browse_page(&table, &query),
-            move |this, page, _, cx| {
+            move |this, page, window, cx| {
+                let design = design::TableDesign::new(&page.columns, window, cx);
                 let tab = &mut this.services.table_tabs[index];
+                tab.design = design;
                 tab.request = request;
+                // 功能：结构变更后按字段名重新映射筛选、排序及隐藏列，避免错位或越界；时间：2026-11-12；作者：lq。
+                let previous = &tab.grid.read(cx).delegate().page.columns;
+                for filter in &mut tab.filters {
+                    filter.column = previous
+                        .get(filter.column)
+                        .and_then(|old| page.columns.iter().position(|c| c.name == old.name))
+                        .unwrap_or(0);
+                }
+                tab.order = tab
+                    .order
+                    .iter()
+                    .filter_map(|(i, desc)| {
+                        previous
+                            .get(*i)
+                            .and_then(|old| page.columns.iter().position(|c| c.name == old.name))
+                            .map(|i| (i, *desc))
+                    })
+                    .collect();
                 tab.grid.update(cx, |state, cx| {
-                    let hidden = state.delegate().hidden.clone();
-                    *state.delegate_mut() = TableRows::new(page);
-                    state.delegate_mut().hidden = hidden
-                        .into_iter()
-                        .filter(|i| *i < state.delegate().page.columns.len())
+                    let hidden: Vec<_> = state
+                        .delegate()
+                        .hidden
+                        .iter()
+                        .filter_map(|i| state.delegate().page.columns.get(*i))
+                        .map(|c| c.name.clone())
                         .collect();
+                    *state.delegate_mut() = TableRows::new(page);
+                    state.delegate_mut().hidden = state
+                        .delegate()
+                        .page
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, c)| hidden.contains(&c.name).then_some(i))
+                        .collect();
+                    if state.delegate().hidden.len() == state.delegate().page.columns.len() {
+                        state.delegate_mut().hidden.clear();
+                    }
                     state.clear_selection(cx);
                     state.refresh(cx);
                 });
@@ -452,7 +556,7 @@ impl Workbench {
             return;
         }
         let grid = self.services.table_tabs[index].grid.clone();
-        if grid.read(cx).delegate().changes().is_empty() {
+        if !self.services.table_tabs[index].has_changes(cx) {
             self.remove_table_tab(index, cx);
             return;
         }
@@ -477,6 +581,88 @@ impl Workbench {
         })
         .detach();
     }
+    /// 功能：按点击时标签身份批量关闭，统一确认脏草稿，取消时全部保留；时间：2026-11-12；作者：lq。
+    pub(super) fn close_table_tabs(
+        &mut self,
+        anchor: &Entity<TableState<TableRows>>,
+        mode: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.services.busy {
+            return;
+        }
+        let Some(index) = self
+            .services
+            .table_tabs
+            .iter()
+            .position(|t| &t.grid == anchor)
+        else {
+            return;
+        };
+        let targets: Vec<_> = self
+            .services
+            .table_tabs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| match mode {
+                0 => *i == index,
+                1 => *i != index,
+                2 => *i > index,
+                _ => true,
+            })
+            .map(|(_, t)| t.grid.clone())
+            .collect();
+        let dirty = self
+            .services
+            .table_tabs
+            .iter()
+            .filter(|t| targets.contains(&t.grid) && t.has_changes(cx))
+            .count();
+        if dirty == 0 {
+            self.remove_table_tabs(&targets, cx);
+            return;
+        }
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "关闭选项卡并丢弃未保存修改？",
+            Some(&format!(
+                "将关闭 {} 个表标签，其中 {} 个有未保存修改。",
+                targets.len(),
+                dirty
+            )),
+            &["取消", "丢弃并关闭"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await == Ok(1) {
+                let _ = this.update_in(cx, |this, _, cx| {
+                    if !this.services.busy {
+                        this.remove_table_tabs(&targets, cx);
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+    /// 功能：倒序移除原标签实体，避免关闭过程中索引偏移；时间：2026-11-12；作者：lq。
+    fn remove_table_tabs(
+        &mut self,
+        targets: &[Entity<TableState<TableRows>>],
+        cx: &mut Context<Self>,
+    ) {
+        for i in (0..self.services.table_tabs.len()).rev() {
+            if targets.contains(&self.services.table_tabs[i].grid) {
+                self.remove_table_tab(i, cx);
+            }
+        }
+        if let Some(active) = self.services.active_table_tab {
+            let query_active = self.services.query_active;
+            self.activate_table_tab(active, cx);
+            self.services.query_active = query_active;
+        }
+    }
+
     /// 功能：关闭后保持相邻标签及对象页稳定；时间：2026-11-11；作者：lq。
     fn remove_table_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         self.services.table_tabs.remove(index);
@@ -491,6 +677,14 @@ impl Workbench {
                 })
             }
         });
+        if let Some(active) = self.services.active_table_tab {
+            let table = &self.services.table_tabs[active].table;
+            self.services.selected_table = self
+                .services
+                .tables
+                .iter()
+                .position(|t| t.schema == table.schema && t.name == table.name);
+        }
         cx.notify();
     }
 
@@ -500,6 +694,10 @@ impl Workbench {
         index: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
+        if self.services.table_tabs[index].designing {
+            return self.table_design_panel(index, cx);
+        }
+        let toolbar = self.table_filter_toolbar(index, cx);
         let tab = &self.services.table_tabs[index];
         let grid = tab.grid.clone();
         let data = grid.read(cx).delegate();
@@ -510,109 +708,51 @@ impl Workbench {
             .map(|(r, _)| r)
             .or_else(|| grid.read(cx).selected_row());
         let writable = data.page.editable;
-        let locked = self.services.busy;
+        let locked = self.services.busy || tab.design.dirty(cx);
         let request = tab.request.clone();
-        let columns = data.page.columns.clone();
-        let filter_view = cx.entity();
-        let toolbar = h_flex()
-            .p_2()
-            .gap_2()
-            .items_center()
-            .flex_wrap()
-            .border_b_1()
-            .border_color(cx.theme().border)
+
+        // 功能：网格受可用宽高约束，单独预留常显横向滚动条，表头与行共享滚动句柄；时间：2026-11-12；作者：lq。
+        let content = h_flex()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .overflow_hidden()
             .child(
-                Button::new("grid-filter-column")
-                    .small()
-                    .ghost()
-                    .label(format!("筛选字段：{}", columns[tab.filter_column].name))
-                    .disabled(locked)
-                    .dropdown_menu(move |mut menu, _, _| {
-                        for (col, column) in columns.iter().enumerate() {
-                            let view = filter_view.clone();
-                            menu = menu.item(PopupMenuItem::new(column.name.clone()).on_click(
-                                move |_, _, cx| {
-                                    view.update(cx, |this, cx| {
-                                        this.services.table_tabs[index].filter_column = col;
-                                        cx.notify();
-                                    });
-                                },
-                            ));
-                        }
-                        menu
-                    }),
-            )
-            .child(div().w(px(180.)).child(Input::new(&tab.filter).small()))
-            .child(
-                Button::new("grid-apply-filter")
-                    .small()
-                    .label("筛选")
-                    .disabled(locked || dirty)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        let t = &this.services.table_tabs[index];
-                        let text = t.filter.read(cx).value().to_string();
-                        let column = t.grid.read(cx).delegate().page.columns[t.filter_column]
-                            .name
-                            .clone();
-                        this.refresh_table_tab(
-                            BrowseRequest {
-                                page: 0,
-                                filter: if text.is_empty() {
-                                    None
-                                } else {
-                                    Some((column, text))
-                                },
-                            },
-                            window,
-                            cx,
-                        );
-                    })),
-            )
-            .child(
-                Button::new("grid-clear-filter")
-                    .small()
-                    .ghost()
-                    .label("清除")
-                    .disabled(locked || dirty)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.services.table_tabs[index]
-                            .filter
-                            .update(cx, |input, cx| input.set_value("", window, cx));
-                        this.refresh_table_tab(BrowseRequest::default(), window, cx);
-                    })),
-            )
-            .child(div().flex_1())
-            .child(
-                Button::new("grid-fields")
-                    .small()
-                    .ghost()
-                    .label("字段显示")
-                    .selected(tab.fields)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.services.table_tabs[index].fields =
-                            !this.services.table_tabs[index].fields;
-                        cx.notify();
-                    })),
-            )
-            .child(
-                Button::new("grid-details")
-                    .small()
-                    .ghost()
-                    .label("表详情")
-                    .selected(tab.details)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.services.table_tabs[index].details =
-                            !this.services.table_tabs[index].details;
-                        cx.notify();
-                    })),
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .id("grid-viewport")
+                            .test_support()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .overflow_hidden()
+                            .child(
+                                DataTable::new(&grid)
+                                    .small()
+                                    .header_row_height(px(66.))
+                                    .scrollbar_visible(true, false),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("grid-horizontal-scrollbar")
+                            .test_support()
+                            .relative()
+                            .h(px(14.))
+                            .flex_shrink_0()
+                            .w_full()
+                            .child(
+                                Scrollbar::horizontal(&grid.read(cx).horizontal_scroll_handle)
+                                    .viewport_from_layout()
+                                    .mode(ScrollbarMode::Always),
+                            ),
+                    ),
             );
-        let content = h_flex().flex_1().min_h_0().child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .h_full()
-                .child(DataTable::new(&grid).small()),
-        );
         let content = content.when(tab.details, |v| {
             v.child(
                 v_flex()
@@ -670,6 +810,7 @@ impl Workbench {
                                 if c.generated { " · 生成列" } else { "" },
                                 c.default.as_deref().unwrap_or("无")
                             )))
+                            .child(div().text_xs().child(c.comment.clone()))
                     })),
             )
         });
@@ -831,7 +972,9 @@ impl Workbench {
             );
         v_flex()
             .size_full()
+            .min_w_0()
             .min_h_0()
+            .overflow_hidden()
             .child(toolbar)
             .when(tab.fields, |v| {
                 v.child(h_flex().p_2().gap_3().flex_wrap().children(
@@ -857,6 +1000,7 @@ impl Workbench {
             })
             .child(content)
             .child(bottom)
+            .into_any_element()
     }
 
     /// 功能：选中单元格显式设置 NULL，新行可恢复 DEFAULT；时间：2026-11-11；作者：lq。

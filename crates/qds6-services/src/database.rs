@@ -2,7 +2,7 @@
 
 // 功能：导出原生表数据网格服务；时间：2026-11-11；作者：lq。
 mod grid;
-pub use grid::{BrowseRequest, GridColumn, PAGE_SIZE, RowChange, TablePage};
+pub use grid::{BrowseRequest, FilterOp, GridColumn, GridFilter, PAGE_SIZE, RowChange, TablePage};
 
 use futures_util::TryStreamExt;
 use qds6_core::{ConnectionProfile, Protocol, TlsMode};

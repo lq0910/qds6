@@ -325,7 +325,30 @@ impl Workbench {
             .max_width(px(210.))
             .menu(items.len() > 3)
             .track_scroll(&self.workspace_scroll)
-            .selected_index(selected);
+            .selected_index(selected)
+            .when(self.tab != 5, |bar| {
+                // 功能：侧栏开关作为 Kit 标签栏前缀，共用栏背景与底线，取消常驻选中底色；时间：2026-11-12；作者：lq。
+                bar.prefix(
+                    h_flex().h_full().px_1().flex_shrink_0().child(
+                        Button::new("toggle-connection-sidebar")
+                            .ghost()
+                            .small()
+                            .icon(
+                                Icon::new(UiIcon::PanelLeft)
+                                    .text_color(cx.theme().muted_foreground),
+                            )
+                            .tooltip(if self.sidebar_visible {
+                                "收起连接列表"
+                            } else {
+                                "展开连接列表"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.sidebar_visible = !this.sidebar_visible;
+                                cx.notify();
+                            })),
+                    ),
+                )
+            });
         for (target, label, icon, closable) in items {
             let close_id = match target {
                 Connection => "workspace-close-connection".to_string(),
@@ -398,25 +421,6 @@ impl Workbench {
             .w_full()
             .min_w_0()
             .flex_shrink_0()
-            // 功能：收放按钮固定在标签栏左端，收起后仍能一键展开；时间：2026-11-11；作者：lq。
-            .when(self.tab != 5, |row| {
-                row.child(
-                    Button::new("toggle-connection-sidebar")
-                        .ghost()
-                        .small()
-                        .icon(UiIcon::PanelLeft)
-                        .selected(self.sidebar_visible)
-                        .tooltip(if self.sidebar_visible {
-                            "收起连接列表"
-                        } else {
-                            "展开连接列表"
-                        })
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.sidebar_visible = !this.sidebar_visible;
-                            cx.notify();
-                        })),
-                )
-            })
             // 功能：复用 Kit 标签栏底边，避免双重分隔线；时间：2026-11-11；作者：lq。
             .child(div().flex_1().min_w_0().child(bar))
     }

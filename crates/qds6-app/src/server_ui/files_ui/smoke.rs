@@ -1,8 +1,10 @@
 //! 功能：仅连接回环 fixture，复现隐藏目录误报为空并验证原生收放与终端留白；时间：2026-11-11；作者：lq。
 
 use super::*;
+// 功能：原生鼠标拖动事件转换，避免与组件输入事件同名；时间：2026-11-12；作者：lq。
 use crate::workspace_ui::WorkspaceTarget;
-use gpui_kit::test::TestWindowExt;
+use gpui_kit::InputEvent as _;
+use gpui_kit::{component::scroll::ScrollbarHandle, test::TestWindowExt};
 use qds6_services::ssh::{self, SshError};
 use std::time::Instant;
 
@@ -137,6 +139,15 @@ pub fn run_sidebar_files_smoke() {
         &root,
         &remote_root,
     );
+    verify_file_scrolling(
+        &mut cx,
+        handle,
+        &view,
+        &server,
+        &client,
+        &root,
+        &remote_root,
+    );
     for (path, expected) in [
         (&hidden, "仅含 2 个隐藏项"),
         (&empty, "空文件夹"),
@@ -161,12 +172,9 @@ pub fn run_sidebar_files_smoke() {
                 server.read(cx).file_row(true, &path.join("readme.txt"), cx);
                 assert!(
                     browser
-                        .tree
-                        .read(cx)
-                        .index_of(&SharedString::from(
-                            path.join(".profile").display().to_string()
-                        ))
-                        .is_none()
+                        .visible_entries(false)
+                        .iter()
+                        .all(|e| e.name != ".profile")
                 );
             } else {
                 assert!(browser.empty_hint(path, false).starts_with(expected));
@@ -264,6 +272,17 @@ pub fn run_sidebar_files_smoke() {
                 assert!(content.origin.x >= grid.origin.x + px(12.));
                 assert!(content.origin.y >= grid.origin.y + px(8.));
                 assert!(content.right() <= grid.right() - px(12.));
+                // 功能：窄窗口下上传下载完整落在各自栏内，不能被溢出裁切；时间：2026-11-12；作者：lq。
+                let local = window.find("server-local-pane").bounds();
+                let remote = window.find("server-remote-pane").bounds();
+                let upload = window.find("upload").bounds();
+                let download = window.find("download").bounds();
+                assert!(upload.origin.x >= local.origin.x && upload.right() <= local.right());
+                assert!(download.origin.x >= remote.origin.x && download.right() <= remote.right());
+                let toggle = window.find("toggle-connection-sidebar").bounds();
+                let strip = window.find("workspace-tab-strip").bounds();
+                assert_eq!(toggle.center().y, strip.center().y);
+                assert!(toggle.origin.x >= strip.origin.x && toggle.right() <= strip.right());
                 window.click("toggle-connection-sidebar", cx);
                 grid
             })
@@ -309,6 +328,34 @@ pub fn run_sidebar_files_smoke() {
             .unwrap()
             .save(format!("output/sidebar-files/expanded-{width:.0}.png"))
             .unwrap();
+        // 功能：默认与最小窗口都可切换远程全宽，工具栏保持可见；时间：2026-11-12；作者：lq。
+        cx.update_window(handle, |_, window, cx| {
+            window.click("toggle-local-files", cx)
+        })
+        .unwrap();
+        settle(&mut cx, handle, &view);
+        cx.update_window(handle, |_, window, _| {
+            assert!(window.try_find("server-local-pane").is_none());
+            let remote = window.find("server-remote-pane").bounds();
+            let terminal = window.find("server-terminal-pane").bounds();
+            assert_eq!(remote.size.width, terminal.size.width);
+            assert!(window.find("toggle-local-files").visible());
+            // 功能：隐藏本地后显示可调宽的远程树，路径栏与列表仍保持可见；时间：2026-11-12；作者：lq。
+            let tree = window.find("remote-directory-tree").bounds();
+            let list = window.find("file-details-scroll-remote").bounds();
+            assert!(tree.size.width >= px(110.) && tree.size.width <= px(320.));
+            assert!(tree.right() <= list.origin.x);
+        })
+        .unwrap();
+        cx.capture_screenshot(handle)
+            .unwrap()
+            .save(format!("output/sidebar-files/remote-only-{width:.0}.png"))
+            .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            window.click("toggle-local-files", cx)
+        })
+        .unwrap();
+        settle(&mut cx, handle, &view);
     }
     // 功能：设置页原生点击联动开关，保存后返回真实终端核对深浅色及固定覆盖；时间：2026-11-11；作者：lq。
     for (mode, name) in [
@@ -423,7 +470,7 @@ fn verify_explorer(
     })
     .unwrap();
     settle(cx, handle, view);
-    // 功能：双击进入只显示下一层，父目录树与地址同步，返回上级不残留选择；时间：2026-11-11；作者：lq。
+    // 功能：双击进入只显示下一层，地址同步，返回上级不残留选择；时间：2026-11-12；作者：lq。
     cx.update_window(handle, |_, window, cx| {
         let row = server.read(cx).file_row(false, &local.join("folder"), cx);
         window.double_click(row, cx);
@@ -433,53 +480,12 @@ fn verify_explorer(
     cx.update(|cx| {
         let state = server.read(cx);
         assert_eq!(state.services.files.local.current, local.join("folder"));
-        assert_eq!(state.services.files.local.root, local);
         assert_eq!(state.services.files.local.visible_entries(false).len(), 2);
         assert!(state.services.files.local.selection.is_empty());
         assert_eq!(
             state.services.local_directory.read(cx).value().as_str(),
             local.join("folder").to_str().unwrap()
         );
-        assert!(
-            state
-                .services
-                .files
-                .local
-                .tree
-                .read(cx)
-                .index_of(&SharedString::from(
-                    local.join("folder/nested.txt").display().to_string()
-                ))
-                .is_none()
-        );
-    });
-    cx.update_window(handle, |_, window, cx| {
-        window.click("parent-directory-local", cx)
-    })
-    .unwrap();
-    settle(cx, handle, view);
-    // 功能：单击左侧目录树也可定位当前文件夹；时间：2026-11-11；作者：lq。
-    cx.update_window(handle, |_, window, cx| {
-        let index = server
-            .read(cx)
-            .services
-            .files
-            .local
-            .tree
-            .read(cx)
-            .index_of(&SharedString::from(
-                local.join("folder").display().to_string(),
-            ))
-            .unwrap();
-        window.click(("local-directory", index), cx);
-    })
-    .unwrap();
-    settle(cx, handle, view);
-    cx.update(|cx| {
-        assert_eq!(
-            server.read(cx).services.files.local.current,
-            local.join("folder")
-        )
     });
     cx.update_window(handle, |_, window, cx| {
         window.click("parent-directory-local", cx)
@@ -570,20 +576,14 @@ fn verify_explorer(
         assert!(entry.gid.is_some());
         assert_ne!(entry.permissions, 0);
     });
-    // 功能：目录树收起后保留当前路径，横向滚动能实际查看远端全部属性列；时间：2026-11-11；作者：lq。
+    // 功能：双列表横向滚动可查看远端全部属性列，不改变当前目录；时间：2026-11-12；作者：lq。
     cx.update_window(handle, |_, window, cx| {
-        window.click("toggle-directories-remote", cx);
-        window.scroll(
-            "file-details-scroll-remote",
-            ScrollDelta::Pixels(point(px(-900.), px(0.))),
-            cx,
-        );
+        drag_file_scrollbar(window, FileSide::Remote, Axis::Horizontal, true, cx);
     })
     .unwrap();
     settle(cx, handle, view);
     cx.update(|cx| {
         let browser = &server.read(cx).services.files.remote;
-        assert!(!browser.show_directories);
         assert!(browser.horizontal.offset().x < px(0.));
         assert_eq!(browser.current, uploaded);
     });
@@ -592,16 +592,11 @@ fn verify_explorer(
         .save("output/sidebar-files/explorer-attributes.png")
         .unwrap();
     cx.update_window(handle, |_, window, cx| {
-        window.scroll(
-            "file-details-scroll-remote",
-            ScrollDelta::Pixels(point(px(900.), px(0.))),
-            cx,
-        );
-        window.click("toggle-directories-remote", cx);
+        drag_file_scrollbar(window, FileSide::Remote, Axis::Horizontal, false, cx);
     })
     .unwrap();
     settle(cx, handle, view);
-    // 功能：远程全选后拖入本地目录树，核对所有文件与空目录真实下载；时间：2026-11-11；作者：lq。
+    // 功能：远程全选后拖入本地列表空白区，核对所有文件与空目录真实下载；时间：2026-11-12；作者：lq。
     cx.update_window(handle, |_, window, cx| {
         server.update(cx, |state, cx| {
             state.navigate_directory(FileSide::Local, download.clone(), window, cx)
@@ -616,16 +611,7 @@ fn verify_explorer(
     settle(cx, handle, view);
     cx.update_window(handle, |_, window, cx| {
         let source = server.read(cx).file_row(true, &uploaded.join("b.txt"), cx);
-        let target = server
-            .read(cx)
-            .services
-            .files
-            .local
-            .tree
-            .read(cx)
-            .index_of(&SharedString::from(download.display().to_string()))
-            .unwrap();
-        window.drag_to(source, ("local-directory", target), cx);
+        window.drag_to(source, "local-files-drop", cx);
     })
     .unwrap();
     settle(cx, handle, view);
@@ -637,11 +623,501 @@ fn verify_explorer(
         assert_eq!(std::fs::read_to_string(download.join(name)).unwrap(), text);
     }
     assert!(download.join("folder/empty").is_dir());
+    // 功能：隐藏本地后远程占满区域，下载仍使用原本地目录，重新展开保留选择；时间：2026-11-12；作者：lq。
+    cx.update_window(handle, |_, window, cx| {
+        let local_row = server.read(cx).file_row(false, &download.join("a.txt"), cx);
+        window.click(local_row, cx);
+        window.click("toggle-local-files", cx);
+    })
+    .unwrap();
+    settle(cx, handle, view);
+    cx.update_window(handle, |_, window, cx| {
+        assert!(window.try_find("server-local-pane").is_none());
+        let remote = window.find("server-remote-pane").bounds();
+        let terminal = window.find("server-terminal-pane").bounds();
+        assert_eq!(remote.size.width, terminal.size.width);
+        assert_eq!(server.read(cx).services.files.local.destination(), download);
+        assert_eq!(server.read(cx).services.files.local.selection.len(), 1);
+    })
+    .unwrap();
+    cx.capture_screenshot(handle)
+        .unwrap()
+        .save("output/sidebar-files/remote-only.png")
+        .unwrap();
+    verify_remote_tree_navigation(cx, handle, view, server, &uploaded);
+    // 功能：本地隐藏时通过下载按钮完成真实写入，核对目标仍为原目录；时间：2026-11-12；作者：lq。
+    let extra = uploaded.join("remote-only.txt");
+    let seed = root.join("remote-only-seed.txt");
+    std::fs::write(&seed, "remote-only download").unwrap();
+    client
+        .upload(&seed, &extra, &sftp::Transfer::default())
+        .unwrap();
+    cx.update_window(handle, |_, window, cx| {
+        server.update(cx, |state, cx| state.refresh_remote(window, cx));
+    })
+    .unwrap();
+    settle(cx, handle, view);
+    cx.update_window(handle, |_, window, cx| {
+        let row = server.read(cx).file_row(true, &extra, cx);
+        window.click(row, cx);
+    })
+    .unwrap();
+    settle(cx, handle, view);
+    cx.update_window(handle, |_, window, cx| window.click("download", cx))
+        .unwrap();
+    settle(cx, handle, view);
+    assert_eq!(
+        std::fs::read_to_string(download.join("remote-only.txt")).unwrap(),
+        "remote-only download"
+    );
+    cx.update_window(handle, |_, window, cx| {
+        window.click("toggle-local-files", cx)
+    })
+    .unwrap();
+    settle(cx, handle, view);
+    cx.update_window(handle, |_, window, cx| {
+        assert!(window.find("server-local-pane").visible());
+        assert!(window.try_find("remote-directory-tree").is_none());
+        let state = server.read(cx);
+        assert_eq!(state.services.files.local.current, download);
+        assert!(
+            state
+                .services
+                .files
+                .local
+                .selection
+                .contains(&download.join("a.txt"))
+        );
+        assert!(state.services.files.remote.selection.contains(&extra));
+    })
+    .unwrap();
     cx.capture_screenshot(handle)
         .unwrap()
         .save("output/sidebar-files/explorer-batch-download.png")
         .unwrap();
     println!(
-        "PASS explorer: enter/parent, directory-only tree, cmd/shift selection, keyboard/reveal select-all, batch drag upload/download, nested and empty folders, remote attributes"
+        "PASS explorer: enter/parent, dual lists, cmd/shift selection, keyboard/reveal select-all, batch drag upload/download, nested and empty folders, remote attributes"
+    );
+}
+
+/// 功能：原生点击远程树验证展开不导航、单击导航、地址栏定位和模式恢复；时间：2026-11-12；作者：lq。
+fn verify_remote_tree_navigation(
+    cx: &mut HeadlessAppContext,
+    handle: AnyWindowHandle,
+    view: &Entity<Workbench>,
+    server: &Entity<ServerWorkspace>,
+    uploaded: &Path,
+) {
+    let folder = uploaded.join("folder");
+    let empty = folder.join("empty");
+    let row = reveal_remote_tree_row(cx, handle, view, server, &folder);
+    cx.update(|cx| {
+        let state = server.read(cx);
+        let tree = state.services.files.remote_tree.state.read(cx);
+        assert!(
+            tree.index_of(&SharedString::from(
+                uploaded.join("a.txt").display().to_string()
+            ))
+            .is_none()
+        );
+        assert_eq!(state.services.files.remote.current, uploaded);
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.click(("remote-directory-toggle", row), cx)
+    })
+    .unwrap();
+    settle(cx, handle, view);
+    cx.update(|cx| {
+        let state = server.read(cx);
+        assert_eq!(
+            state.services.files.remote.current, uploaded,
+            "expansion must not navigate"
+        );
+        assert!(
+            state
+                .services
+                .files
+                .remote_tree
+                .state
+                .read(cx)
+                .index_of(&SharedString::from(empty.display().to_string()))
+                .is_some()
+        );
+    });
+    let row = reveal_remote_tree_row(cx, handle, view, server, &folder);
+    cx.update_window(handle, |_, window, cx| {
+        window.click(("remote-directory", row), cx)
+    })
+    .unwrap();
+    settle(cx, handle, view);
+    cx.update(|cx| {
+        let state = server.read(cx);
+        assert_eq!(state.services.files.remote.current, folder);
+        assert_eq!(
+            state.services.remote_path.read(cx).value().as_str(),
+            folder.to_str().unwrap()
+        );
+        state.file_row(true, &folder.join("nested.txt"), cx);
+    });
+    // 功能：列表的上级与双击进入同步树中高亮，地址栏回车可重新定位祖先目录；时间：2026-11-12；作者：lq。
+    cx.update_window(handle, |_, window, cx| {
+        window.click("parent-directory-remote", cx)
+    })
+    .unwrap();
+    settle(cx, handle, view);
+    cx.update_window(handle, |_, window, cx| {
+        let row = server.read(cx).file_row(true, &folder, cx);
+        window.double_click(row, cx);
+    })
+    .unwrap();
+    settle(cx, handle, view);
+    cx.update(|cx| {
+        let state = server.read(cx);
+        let selected = state
+            .services
+            .files
+            .remote_tree
+            .state
+            .read(cx)
+            .selected_item()
+            .unwrap();
+        assert_eq!(selected.id.as_str(), folder.to_str().unwrap());
+    });
+    cx.update_window(handle, |_, window, cx| {
+        server.update(cx, |state, cx| {
+            state.services.remote_path.update(cx, |input, cx| {
+                input.set_value(uploaded.display().to_string(), window, cx)
+            });
+        });
+        // 功能：真实聚焦地址栏并按回车，覆盖输入订阅而非直接调用刷新；时间：2026-11-12；作者：lq。
+        let input = server.read(cx).services.remote_path.clone();
+        input.update(cx, |input, cx| input.focus(window, cx));
+        window.press("enter", cx);
+    })
+    .unwrap();
+    settle(cx, handle, view);
+    cx.update(|cx| {
+        let state = server.read(cx);
+        assert_eq!(state.services.files.remote.current, uploaded);
+        assert_eq!(
+            state
+                .services
+                .files
+                .remote_tree
+                .state
+                .read(cx)
+                .selected_item()
+                .unwrap()
+                .id
+                .as_str(),
+            uploaded.to_str().unwrap()
+        );
+    });
+    cx.capture_screenshot(handle)
+        .unwrap()
+        .save("output/sidebar-files/remote-tree-navigation.png")
+        .unwrap();
+    println!(
+        "PASS remote tree: directories only, lazy expand without navigation, click/parent/double-click/address synchronization"
+    );
+}
+
+/// 功能：测试先揭示目录行再发送鼠标事件，避免根目录兄弟节点较多导致目标不可见；时间：2026-11-12；作者：lq。
+fn reveal_remote_tree_row(
+    cx: &mut HeadlessAppContext,
+    handle: AnyWindowHandle,
+    view: &Entity<Workbench>,
+    server: &Entity<ServerWorkspace>,
+    path: &Path,
+) -> usize {
+    let index = cx.update(|cx| {
+        let state = server.read(cx).services.files.remote_tree.state.clone();
+        state.update(cx, |state, _| {
+            let index = state
+                .index_of(&SharedString::from(path.display().to_string()))
+                .expect("directory must be in remote tree");
+            state.scroll_to_item(index, ScrollStrategy::Center);
+            index
+        })
+    });
+    settle(cx, handle, view);
+    index
+}
+
+/// 功能：真实拖动固定视口滚动条滑块，验证手动交互而非直接修改偏移；时间：2026-11-12；作者：lq。
+fn drag_file_scrollbar(
+    window: &mut Window,
+    side: FileSide,
+    axis: Axis,
+    to_end: bool,
+    cx: &mut App,
+) {
+    let vertical = axis == Axis::Vertical;
+    let bounds = window
+        .find(SharedString::from(format!(
+            "file-{}-track-{}",
+            if vertical { "vertical" } else { "horizontal" },
+            side.id()
+        )))
+        .bounds();
+    let start = if vertical {
+        point(bounds.right() - px(8.), bounds.origin.y + px(8.))
+    } else {
+        point(bounds.origin.x + px(8.), bounds.bottom() - px(8.))
+    };
+    let end = if vertical {
+        point(start.x, bounds.bottom() - px(8.))
+    } else {
+        point(bounds.right() - px(8.), start.y)
+    };
+    let (from, to) = if to_end { (start, end) } else { (end, start) };
+    window.dispatch_event(
+        MouseMoveEvent {
+            position: from,
+            pressed_button: None,
+            modifiers: Modifiers::default(),
+        }
+        .to_platform_input(),
+        cx,
+    );
+    window.render_frame(cx);
+    window.dispatch_event(
+        MouseDownEvent {
+            position: from,
+            button: MouseButton::Left,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        }
+        .to_platform_input(),
+        cx,
+    );
+    for step in 1..=5 {
+        let position = from + (to - from) * (step as f32 / 5.);
+        window.dispatch_event(
+            MouseMoveEvent {
+                position,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::default(),
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+    }
+    window.dispatch_event(
+        MouseUpEvent {
+            position: to,
+            button: MouseButton::Left,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        }
+        .to_platform_input(),
+        cx,
+    );
+    window.render_frame(cx);
+}
+
+/// 功能：长目录回归滚轮纵向与双轴拖动，覆盖两侧列表、窄窗口及远程树模式；时间：2026-11-12；作者：lq。
+fn verify_file_scrolling(
+    cx: &mut HeadlessAppContext,
+    handle: AnyWindowHandle,
+    view: &Entity<Workbench>,
+    server: &Entity<ServerWorkspace>,
+    client: &sftp::Client,
+    root: &Path,
+    remote_root: &Path,
+) {
+    let local = root.join("scrolling");
+    let remote = remote_root.join("scrolling");
+    std::fs::create_dir_all(&local).unwrap();
+    for index in 0..80 {
+        std::fs::write(
+            local.join(format!("file-{index:03}.txt")),
+            format!("row {index}"),
+        )
+        .unwrap();
+    }
+    client
+        .upload_path(&local, &remote, &sftp::Transfer::default())
+        .unwrap();
+    cx.update_window(handle, |_, window, cx| {
+        server.update(cx, |state, cx| {
+            state.navigate_directory(FileSide::Local, local.clone(), window, cx);
+            state.navigate_directory(FileSide::Remote, remote.clone(), window, cx);
+        });
+    })
+    .unwrap();
+    settle(cx, handle, view);
+    for (width, height) in [(1440., 900.), (960., 640.)] {
+        cx.update_window(handle, |_, window, cx| {
+            window.resize(size(px(width), px(height)));
+            window.bounds_changed(cx);
+        })
+        .unwrap();
+        settle(cx, handle, view);
+        for side in [FileSide::Local, FileSide::Remote] {
+            cx.update_window(handle, |_, window, cx| {
+                // 功能：从顶部发普通鼠标滚轮，必须改变纵向而非横向偏移；时间：2026-11-12；作者：lq。
+                server.update(cx, |state, _| {
+                    let browser = state.services.files.browser(side);
+                    browser.scroll.set_offset(point(px(0.), px(0.)));
+                    browser.horizontal.set_offset(point(px(0.), px(0.)));
+                });
+                window.render_frame(cx);
+                window.scroll(
+                    SharedString::from(format!("file-details-scroll-{}", side.id())),
+                    ScrollDelta::Lines(point(0., -3.)),
+                    cx,
+                );
+            })
+            .unwrap();
+            settle(cx, handle, view);
+            cx.update(|cx| {
+                let browser = server.read(cx).services.files.browser(side);
+                assert!(browser.scroll.offset().y < px(0.), "wheel must scroll down");
+                assert_eq!(
+                    browser.horizontal.offset().x,
+                    px(0.),
+                    "vertical wheel must not move columns"
+                );
+            });
+            cx.update_window(handle, |_, window, cx| {
+                // 功能：滚到底部后再滚轮也不得触发横向，之后真实拖动横条；时间：2026-11-12；作者：lq。
+                window.scroll(
+                    SharedString::from(format!("file-details-scroll-{}", side.id())),
+                    ScrollDelta::Pixels(point(px(0.), px(-9000.))),
+                    cx,
+                );
+            })
+            .unwrap();
+            settle(cx, handle, view);
+            cx.update_window(handle, |_, window, cx| {
+                let row = (
+                    if side == FileSide::Local {
+                        "local-entry"
+                    } else {
+                        "remote-entry"
+                    },
+                    79usize,
+                );
+                assert!(window.find(row).visible(), "last file must be reachable");
+                window.scroll(
+                    SharedString::from(format!("file-details-scroll-{}", side.id())),
+                    ScrollDelta::Lines(point(0., -3.)),
+                    cx,
+                );
+                assert_eq!(
+                    server
+                        .read(cx)
+                        .services
+                        .files
+                        .browser(side)
+                        .horizontal
+                        .offset()
+                        .x,
+                    px(0.)
+                );
+                drag_file_scrollbar(window, side, Axis::Horizontal, true, cx);
+            })
+            .unwrap();
+            settle(cx, handle, view);
+            cx.update(|cx| {
+                assert!(
+                    server
+                        .read(cx)
+                        .services
+                        .files
+                        .browser(side)
+                        .horizontal
+                        .offset()
+                        .x
+                        < px(0.)
+                )
+            });
+            cx.update_window(handle, |_, window, cx| {
+                drag_file_scrollbar(window, side, Axis::Horizontal, false, cx);
+                drag_file_scrollbar(window, side, Axis::Vertical, false, cx);
+            })
+            .unwrap();
+            settle(cx, handle, view);
+            cx.update_window(handle, |_, window, cx| {
+                assert!(
+                    window
+                        .find((
+                            if side == FileSide::Local {
+                                "local-entry"
+                            } else {
+                                "remote-entry"
+                            },
+                            0usize
+                        ))
+                        .visible()
+                );
+                drag_file_scrollbar(window, side, Axis::Vertical, true, cx);
+            })
+            .unwrap();
+            settle(cx, handle, view);
+            cx.update_window(handle, |_, window, _| {
+                assert!(
+                    window
+                        .find((
+                            if side == FileSide::Local {
+                                "local-entry"
+                            } else {
+                                "remote-entry"
+                            },
+                            79usize
+                        ))
+                        .visible(),
+                    "vertical thumb drag must reach last file"
+                );
+            })
+            .unwrap();
+        }
+        cx.capture_screenshot(handle)
+            .unwrap()
+            .save(format!("output/sidebar-files/scrollbars-{width:.0}.png"))
+            .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            window.click("toggle-local-files", cx)
+        })
+        .unwrap();
+        settle(cx, handle, view);
+        cx.update_window(handle, |_, window, cx| {
+            drag_file_scrollbar(window, FileSide::Remote, Axis::Vertical, false, cx);
+            window.scroll(
+                "file-details-scroll-remote",
+                ScrollDelta::Lines(point(0., -5.)),
+                cx,
+            );
+        })
+        .unwrap();
+        settle(cx, handle, view);
+        cx.update(|cx| {
+            let browser = &server.read(cx).services.files.remote;
+            assert!(browser.scroll.offset().y < px(0.));
+            assert_eq!(browser.horizontal.offset().x, px(0.));
+        });
+        cx.capture_screenshot(handle)
+            .unwrap()
+            .save(format!(
+                "output/sidebar-files/scrollbars-tree-{width:.0}.png"
+            ))
+            .unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            window.click("toggle-local-files", cx)
+        })
+        .unwrap();
+        settle(cx, handle, view);
+    }
+    cx.update_window(handle, |_, window, cx| {
+        window.resize(size(px(1440.), px(900.)));
+        window.bounds_changed(cx);
+    })
+    .unwrap();
+    settle(cx, handle, view);
+    println!(
+        "PASS file scrolling: 80 real local/remote files, vertical line/pixel wheel, end-of-list, both scrollbar thumb drags, 1440/960 dual-list and remote-tree modes"
     );
 }

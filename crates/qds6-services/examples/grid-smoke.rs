@@ -1,6 +1,8 @@
 //! 功能：仅针对本机专用容器验证表网格读写、回滚及并发冲突；时间：2026-11-11；作者：lq。
 use qds6_core::{ConnectionProfile, Protocol, TlsMode};
-use qds6_services::database::{BrowseRequest, Cell, DatabaseSession, PAGE_SIZE, RowChange, Table};
+use qds6_services::database::{
+    BrowseRequest, Cell, DatabaseSession, FilterOp, GridFilter, PAGE_SIZE, RowChange, Table,
+};
 
 /// 功能：专用测试库使用固定回环端口，不读取任何业务配置；时间：2026-11-11；作者：lq。
 fn session(protocol: Protocol, port: u16) -> DatabaseSession {
@@ -28,8 +30,19 @@ fn check(protocol: Protocol, port: u16) {
     };
     let q = |table: &Table| format!("{}.{}", table.schema, table.name);
     db.query(&format!("CREATE TABLE {} (a INT NOT NULL, b INT NOT NULL, value TEXT, amount INT NOT NULL DEFAULT 7, PRIMARY KEY(a,b))", q(&table))).unwrap();
+    // 功能：验证备注及完整字段类型，不依赖界面猜测元数据；时间：2026-11-12；作者：lq。
+    db.query(&if protocol == Protocol::PostgreSql {
+        format!("COMMENT ON COLUMN {}.value IS '字段备注 · lq';", q(&table))
+    } else {
+        format!(
+            "ALTER TABLE {} MODIFY COLUMN value TEXT COMMENT '字段备注 · lq';",
+            q(&table)
+        )
+    })
+    .unwrap();
     let empty = db.browse_page(&table, &BrowseRequest::default()).unwrap();
     assert!(empty.editable);
+    assert_eq!(empty.columns[2].comment, "字段备注 · lq");
     assert_eq!(empty.data.columns.len(), 4);
     assert_eq!(empty.data.rows.len(), 0);
     assert_eq!(empty.columns.iter().filter(|c| c.primary).count(), 2);
@@ -58,6 +71,53 @@ fn check(protocol: Protocol, port: u16) {
     assert_eq!(page.data.rows[0][3], Cell::Text("7".into()));
     assert_eq!(page.data.rows[1][2], Cell::Text(String::new()));
     assert_eq!(page.data.rows[2][2], Cell::Null);
+    // 功能：通配符按字面量处理，空字符串、NULL、AND/OR 与排序在真实数据库执行；时间：2026-11-12；作者：lq。
+    let filter = |column: &str, op, value: &str| GridFilter {
+        column: column.into(),
+        op,
+        value: value.into(),
+    };
+    for (op, value, expected) in [
+        (FilterOp::Contains, "% _", 1),
+        (FilterOp::Equal, "", 1),
+        (FilterOp::IsNull, "", 1),
+        (FilterOp::IsNotNull, "", 2),
+        (FilterOp::StartsWith, "中文", 1),
+        (FilterOp::EndsWith, "_", 1),
+        (FilterOp::NotEqual, "", 1),
+    ] {
+        let result = db
+            .browse_page(
+                &table,
+                &BrowseRequest {
+                    filters: vec![filter("value", op, value)],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            result.data.rows.len(),
+            expected,
+            "{} {}",
+            protocol.label(),
+            op.label()
+        );
+    }
+    let mut request = BrowseRequest {
+        filters: vec![
+            filter("b", FilterOp::Greater, "1"),
+            filter("value", FilterOp::IsNotNull, ""),
+        ],
+        order: vec![("b".into(), true)],
+        ..Default::default()
+    };
+    assert_eq!(db.browse_page(&table, &request).unwrap().data.rows.len(), 1);
+    request.match_any = true;
+    let result = db.browse_page(&table, &request).unwrap();
+    assert_eq!(result.data.rows.len(), 3);
+    assert_eq!(result.data.rows[0][1], Cell::Text("3".into()));
+    request.filters[0].column = "b; DROP TABLE other".into();
+    assert!(db.browse_page(&table, &request).is_err());
     let mut update = RowChange {
         original: Some(page.data.rows[0].clone()),
         values: vec![
@@ -76,6 +136,18 @@ fn check(protocol: Protocol, port: u16) {
             .unwrap_err()
             .contains("其他会话")
     );
+    let numeric = db
+        .browse_page(
+            &table,
+            &BrowseRequest {
+                filters: vec![filter("b", FilterOp::Greater, "2")],
+                order: vec![("b".into(), true)],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(numeric.data.rows.len(), 2);
+    assert_eq!(numeric.data.rows[0][1], Cell::Text("11".into()));
     let page = db.browse_page(&table, &BrowseRequest::default()).unwrap();
     update.original = Some(page.data.rows[2].clone());
     update.values = vec![None, None, Some(Cell::Text("rollback-me".into())), None];
@@ -90,7 +162,12 @@ fn check(protocol: Protocol, port: u16) {
             &table,
             &BrowseRequest {
                 page: 0,
-                filter: Some(("value".into(), "changed".into())),
+                filters: vec![GridFilter {
+                    column: "value".into(),
+                    op: FilterOp::Contains,
+                    value: "changed".into(),
+                }],
+                ..Default::default()
             },
         )
         .unwrap();
@@ -100,7 +177,12 @@ fn check(protocol: Protocol, port: u16) {
             &table,
             &BrowseRequest {
                 page: 0,
-                filter: Some(("value".into(), "' OR 1=1 --".into()))
+                filters: vec![GridFilter {
+                    column: "value".into(),
+                    op: FilterOp::Contains,
+                    value: "' OR 1=1 --".into()
+                }],
+                ..Default::default()
             }
         )
         .unwrap()
@@ -146,7 +228,7 @@ fn check(protocol: Protocol, port: u16) {
             &table,
             &BrowseRequest {
                 page: 1,
-                filter: None,
+                ..Default::default()
             },
         )
         .unwrap();

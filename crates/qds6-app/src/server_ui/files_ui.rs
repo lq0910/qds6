@@ -1,17 +1,17 @@
 //! 功能：原生目录导航、当前目录详情、多选拖放和串行传输；时间：2026-11-11；作者：lq。
 
 use super::*;
-// 功能：目录树与当前目录详情列表分离；时间：2026-11-11；作者：lq。
+// 功能：双列表目录导航与详情展示；时间：2026-11-12；作者：lq。
 mod explorer;
+// 功能：隐藏本地时切换远程目录树与详情布局；时间：2026-11-12；作者：lq。
+mod remote_tree;
 use explorer::{local_owner, local_permissions};
 // 功能：真实 SFTP 隐藏目录和原生侧栏布局专项回归；时间：2026-11-11；作者：lq。
 #[cfg(feature = "ui-tests")]
 pub(super) mod smoke;
 use gpui_kit::component::{
-    list::ListItem,
     menu::{DropdownMenu, PopupMenuItem},
     resizable::h_resizable,
-    tree::{TreeEvent, TreeItem, TreeState, tree},
 };
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -19,7 +19,7 @@ use std::{
     time::Duration,
 };
 
-/// 功能：传输方向及树状态分离，避免两侧路径互相覆盖；时间：2026-11-11；作者：lq。
+/// 功能：传输方向及浏览状态分离，避免两侧路径互相覆盖；时间：2026-11-12；作者：lq。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum FileSide {
     Local,
@@ -35,22 +35,18 @@ impl FileSide {
     }
 }
 
-/// 功能：按绝对路径缓存子目录，目录只在展开时后台读取；时间：2026-11-11；作者：lq。
+/// 功能：后台读取当前目录并保留各侧独立路径、选择与滚动状态；时间：2026-11-12；作者：lq。
 pub(super) struct FileBrowser {
-    pub(super) root: PathBuf,
-    // 功能：树根与当前目录独立，多选范围始终限定当前可见层级；时间：2026-11-11；作者：lq。
+    // 功能：多选范围始终限定当前可见层级；时间：2026-11-12；作者：lq。
     current: PathBuf,
     selection: BTreeSet<PathBuf>,
     anchor: Option<PathBuf>,
     focus: FocusHandle,
     scroll: UniformListScrollHandle,
-    // 功能：每侧独立控制目录导航与详情横向位置；时间：2026-11-11；作者：lq。
+    // 功能：每侧独立保存详情横向滚动位置；时间：2026-11-12；作者：lq。
     horizontal: ScrollHandle,
-    show_directories: bool,
     pub(super) selected: Option<sftp::Entry>,
-    tree: Entity<TreeState>,
     entries: BTreeMap<PathBuf, Vec<sftp::Entry>>,
-    expanded: BTreeSet<PathBuf>,
     loading: BTreeSet<PathBuf>,
     errors: BTreeMap<PathBuf, String>,
     generation: u64,
@@ -71,7 +67,7 @@ impl FileBrowser {
         if self.loading.contains(path) {
             "正在读取…".into()
         } else if self.errors.contains_key(path) {
-            "读取失败 · 收起再展开重试".into()
+            "读取失败 · 点击刷新重试".into()
         } else if self.entries.contains_key(path) {
             let hidden = self.hidden_count(path);
             if !show_hidden && hidden > 0 {
@@ -80,7 +76,7 @@ impl FileBrowser {
                 "空文件夹".into()
             }
         } else {
-            "展开以读取".into()
+            "尚未读取 · 点击刷新".into()
         }
     }
 
@@ -88,31 +84,13 @@ impl FileBrowser {
     pub(super) fn destination(&self) -> PathBuf {
         self.current.clone()
     }
-    /// 功能：统一定位根节点和缓存文件，不解析占位提示行；时间：2026-11-11；作者：lq。
+    /// 功能：仅从当前目录解析选中项，避免跨目录缓存产生错误操作；时间：2026-11-12；作者：lq。
     fn entry(&self, path: &Path) -> Option<sftp::Entry> {
-        if path == self.root {
-            Some(sftp::Entry {
-                path: path.into(),
-                name: path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into(),
-                directory: true,
-                symlink: false,
-                size: 0,
-                permissions: 0,
-                modified: None,
-                uid: None,
-                gid: None,
-            })
-        } else {
-            self.entries
-                .values()
-                .flatten()
-                .find(|entry| entry.path == path)
-                .cloned()
-        }
+        self.entries
+            .get(&self.current)?
+            .iter()
+            .find(|entry| entry.path == path)
+            .cloned()
     }
 }
 
@@ -175,10 +153,14 @@ impl TransferRequest {
     }
 }
 
-/// 功能：每台服务器独立保存双树、订阅、当前任务、排队项目及最近结果；时间：2026-11-11；作者：lq。
+/// 功能：每台服务器独立保存双列表、显示模式、订阅和传输队列；时间：2026-11-12；作者：lq。
 pub(super) struct FilesUi {
     pub(super) local: FileBrowser,
     pub(super) remote: FileBrowser,
+    // 功能：隐藏本地仅改变布局，保留下载目标、选择和传输队列；时间：2026-11-12；作者：lq。
+    show_local: bool,
+    // 功能：远程树独立保留展开状态及目录缓存；时间：2026-11-12；作者：lq。
+    remote_tree: remote_tree::RemoteDirectoryTree,
     queue: VecDeque<TransferRequest>,
     active: Option<TransferRequest>,
     history: VecDeque<String>,
@@ -192,6 +174,7 @@ impl FilesUi {
             || !self.queue.is_empty()
             || !self.local.loading.is_empty()
             || !self.remote.loading.is_empty()
+            || !self.remote_tree.loading.is_empty()
     }
     /// 功能：借用所需一侧的状态；时间：2026-11-11；作者：lq。
     fn browser(&self, side: FileSide) -> &FileBrowser {
@@ -201,7 +184,7 @@ impl FilesUi {
             &self.remote
         }
     }
-    /// 功能：只修改目标侧的树，不重建对侧；时间：2026-11-11；作者：lq。
+    /// 功能：只修改目标侧文件浏览状态；时间：2026-11-12；作者：lq。
     fn browser_mut(&mut self, side: FileSide) -> &mut FileBrowser {
         if side == FileSide::Local {
             &mut self.local
@@ -212,131 +195,40 @@ impl FilesUi {
 }
 
 impl ServerWorkspace {
-    /// 功能：安装两侧目录树的原生展开和收起订阅；时间：2026-11-11；作者：lq。
-    pub(super) fn new_files_ui(window: &mut Window, cx: &mut Context<Self>) -> FilesUi {
-        let local = cx.new(|cx| TreeState::new(cx));
-        let remote = cx.new(|cx| TreeState::new(cx));
-        let mut subscriptions = Vec::new();
-        for (side, state) in [(FileSide::Local, &local), (FileSide::Remote, &remote)] {
-            subscriptions.push(cx.subscribe_in(
-                state,
-                window,
-                move |this, _, event: &TreeEvent, window, cx| {
-                    match event {
-                        TreeEvent::Expanded(id) => {
-                            let path = PathBuf::from(id.as_str());
-                            let browser = this.services.files.browser_mut(side);
-                            browser.expanded.insert(path.clone());
-                            if !browser.entries.contains_key(&path) {
-                                this.load_directory(side, path, window, cx);
-                            }
-                        }
-                        TreeEvent::Collapsed(id) => {
-                            this.services
-                                .files
-                                .browser_mut(side)
-                                .expanded
-                                .remove(Path::new(id.as_str()));
-                        }
-                    }
-                    cx.notify();
-                },
-            ));
-        }
-        // 功能：树根初始由现有地址栏提供，首次读取成功再转成真实绝对路径；时间：2026-11-11；作者：lq。
-        let browser = |tree| FileBrowser {
-            root: PathBuf::new(),
+    /// 功能：初始化双列表，各自持有焦点、路径及滚动，默认同时显示本地和远程；时间：2026-11-12；作者：lq。
+    pub(super) fn new_files_ui(_window: &mut Window, cx: &mut Context<Self>) -> FilesUi {
+        let browser = || FileBrowser {
             current: PathBuf::new(),
             selection: BTreeSet::new(),
             anchor: None,
             focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             horizontal: ScrollHandle::new(),
-            show_directories: true,
-            tree,
             selected: None,
             entries: BTreeMap::new(),
-            expanded: BTreeSet::new(),
             loading: BTreeSet::new(),
             errors: BTreeMap::new(),
             generation: 0,
         };
         FilesUi {
-            local: browser(local),
-            remote: browser(remote),
+            local: browser(),
+            remote: browser(),
+            show_local: true,
+            remote_tree: remote_tree::RemoteDirectoryTree::new(cx),
             queue: VecDeque::new(),
             active: None,
             history: VecDeque::new(),
             progress_task: None,
-            subscriptions,
+            subscriptions: Vec::new(),
         }
     }
 
-    /// 功能：按需重建可见树并恢复选中路径，保留键盘导航与滚动状态；时间：2026-11-11；作者：lq。
-    fn rebuild_tree(&mut self, side: FileSide, cx: &mut Context<Self>) {
+    /// 功能：隐藏过滤与刷新后同步有效选择；时间：2026-11-12；作者：lq。
+    fn refresh_file_selection(&mut self, side: FileSide) {
         self.services
             .files
             .browser_mut(side)
             .prune_selection(self.services.show_hidden);
-        let browser = self.services.files.browser(side);
-        let items = if browser.root.as_os_str().is_empty() {
-            vec![]
-        } else {
-            vec![Self::tree_node(
-                &browser.root,
-                browser,
-                self.services.show_hidden,
-                0,
-            )]
-        };
-        let selected = Some(SharedString::from(browser.current.display().to_string()));
-        let tree = browser.tree.clone();
-        tree.update(cx, |state, cx| {
-            state.set_items(items, cx);
-            let ix = selected.as_ref().and_then(|id| state.index_of(id));
-            state.set_selected_index(ix, cx);
-        });
-    }
-
-    /// 功能：有界构造层级，未加载、空目录和读取失败使用禁用提示节点；时间：2026-11-11；作者：lq。
-    fn tree_node(path: &Path, browser: &FileBrowser, hidden: bool, depth: usize) -> TreeItem {
-        let id = path.display().to_string();
-        let label = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .unwrap_or("/")
-            .to_string();
-        let node = TreeItem::new(id.clone(), label).expanded(browser.expanded.contains(path));
-        let children: Vec<_> = browser
-            .entries
-            .get(path)
-            .into_iter()
-            .flatten()
-            .filter(|entry| {
-                entry.directory && !entry.symlink && (hidden || !entry.name.starts_with('.'))
-            })
-            .map(|entry| {
-                if entry.directory && !entry.symlink && depth < 64 {
-                    Self::tree_node(&entry.path, browser, hidden, depth + 1)
-                } else {
-                    TreeItem::new(entry.path.display().to_string(), entry.name.clone())
-                }
-            })
-            .collect();
-        if !children.is_empty() {
-            node.children(children)
-        } else {
-            let hint = if browser.entries.contains_key(path)
-                && !browser.loading.contains(path)
-                && !browser.errors.contains_key(path)
-            {
-                "无子文件夹".into()
-            } else {
-                browser.empty_hint(path, hidden)
-            };
-            node.child(TreeItem::new(format!("qds6-placeholder:{id}"), hint).disabled(true))
-        }
     }
 
     /// 功能：后台读取本地目录，不跟随符号链接并限制单目录数量；时间：2026-11-11；作者：lq。
@@ -398,7 +290,7 @@ impl ServerWorkspace {
         let generation = browser.generation;
         let is_root = path == browser.current;
         let requested = path.clone();
-        self.rebuild_tree(side, cx);
+        self.refresh_file_selection(side);
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
@@ -432,6 +324,8 @@ impl ServerWorkspace {
                 browser.loading.remove(&requested);
                 let is_current = is_root && browser.current == requested;
                 let mut recovered_error = None;
+                // 功能：成功读取后同步目录树缓存，文件列表缓存仍按导航代次管理；时间：2026-11-12；作者：lq。
+                let mut refreshed_path = None;
                 match result {
                     Ok((path, entries)) => {
                         if browser.entries.values().map(Vec::len).sum::<usize>()
@@ -441,17 +335,14 @@ impl ServerWorkspace {
                         {
                             browser.errors.insert(
                                 requested.clone(),
-                                "展开的目录超过 100000 项，请切换树根".into(),
+                                "目录缓存超过 100000 项，请切换目录".into(),
                             );
                         } else {
                             if is_current && browser.current != path {
-                                if browser.root == requested {
-                                    browser.root = path.clone();
-                                }
                                 browser.current = path.clone();
-                                browser.expanded.insert(path.clone());
                             }
                             recovered_error = browser.errors.remove(&requested);
+                            refreshed_path = Some(path.clone());
                             browser.entries.insert(path.clone(), entries);
                             browser.prune_selection(this.services.show_hidden);
                             if is_current {
@@ -477,7 +368,20 @@ impl ServerWorkspace {
                     this.status = "服务器已连接 · 终端与文件互不阻塞".into();
                     this.error = false;
                 }
-                this.rebuild_tree(side, cx);
+                this.refresh_file_selection(side);
+                if side == FileSide::Remote {
+                    let files = &mut this.services.files;
+                    if let Some(path) = refreshed_path
+                        && let Some(entries) = files.remote.entries.get(&path)
+                    {
+                        files.remote_tree.cache(path, entries);
+                    }
+                    if is_current {
+                        this.sync_remote_tree(window, cx);
+                    } else if !this.services.files.show_local {
+                        this.rebuild_remote_tree(false, cx);
+                    }
+                }
                 cx.notify();
             });
         })
@@ -485,7 +389,7 @@ impl ServerWorkspace {
         cx.notify();
     }
 
-    /// 功能：地址变化时切换树根，刷新时保留已展开目录；时间：2026-11-11；作者：lq。
+    /// 功能：地址变化时进入目录，同路径刷新保留有效选择；时间：2026-11-12；作者：lq。
     fn refresh_browser(&mut self, side: FileSide, window: &mut Window, cx: &mut Context<Self>) {
         let input = if side == FileSide::Local {
             &self.services.local_directory
@@ -509,26 +413,6 @@ impl ServerWorkspace {
     /// 功能：本地刷新不占用远程文件任务槽；时间：2026-11-11；作者：lq。
     pub(crate) fn refresh_local(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_browser(FileSide::Local, window, cx);
-    }
-
-    /// 功能：箭头和双击切换目录，单击只选择，保持目标选择稳定；时间：2026-11-11；作者：lq。
-    fn toggle_directory(
-        &mut self,
-        side: FileSide,
-        path: PathBuf,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let browser = self.services.files.browser_mut(side);
-        if !browser.expanded.remove(&path) {
-            browser.expanded.insert(path.clone());
-            if !browser.entries.contains_key(&path) {
-                self.load_directory(side, path, window, cx);
-                return;
-            }
-        }
-        self.rebuild_tree(side, cx);
-        cx.notify();
     }
 
     /// 功能：当前层级选中项目批量传向对侧当前目录；时间：2026-11-11；作者：lq。
@@ -667,15 +551,6 @@ impl ServerWorkspace {
         } else {
             &self.services.remote_path
         };
-        let root = browser.current.clone();
-        // 功能：底部展示真实总数和隐藏项，明确目录已成功读取；时间：2026-11-11；作者：lq。
-        let hidden_count = browser.hidden_count(&root);
-        let hidden_only = !self.services.show_hidden
-            && hidden_count > 0
-            && browser
-                .entries
-                .get(&root)
-                .is_some_and(|entries| entries.len() == hidden_count);
         let selected = format!(
             "{} 项 · 已选 {} 项 · 双击进入 / ⌘或Ctrl多选 / Shift连选",
             browser.visible_entries(self.services.show_hidden).len(),
@@ -690,7 +565,6 @@ impl ServerWorkspace {
                 FileSide::Local
             })
             .destination();
-        let directories = self.directory_tree(side, cx);
         let files = self.directory_list(side, cx);
         let drop_view = cx.entity();
         let directory = browser.destination();
@@ -711,23 +585,7 @@ impl ServerWorkspace {
                     .px_2()
                     .h(px(32.))
                     .flex_shrink_0()
-                    .gap_2()
-                    .child(
-                        Button::new(SharedString::from(format!(
-                            "toggle-directories-{}",
-                            side.id()
-                        )))
-                        .ghost()
-                        .xsmall()
-                        .icon(UiIcon::Folder)
-                        .selected(browser.show_directories)
-                        .tooltip("显示 / 收起目录树")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            let browser = this.services.files.browser_mut(side);
-                            browser.show_directories = !browser.show_directories;
-                            cx.notify();
-                        })),
-                    )
+                    .gap_1()
                     .child(
                         div()
                             .text_xs()
@@ -743,25 +601,11 @@ impl ServerWorkspace {
                             Button::new("choose-local-directory")
                                 .ghost()
                                 .xsmall()
-                                .label("选择目录")
-                                .tooltip("选择本地文件树的起始文件夹")
+                                // 功能：目录选择使用紧凑图标，最小窗口也为上传按钮保留完整空间；时间：2026-11-12；作者：lq。
+                                .icon(UiIcon::FolderOpen)
+                                .tooltip("选择本地目录")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.choose_local_directory(window, cx)
-                                })),
-                        )
-                    })
-                    // 功能：仅含隐藏项时一键展示，无需猜测连接是否失败；时间：2026-11-11；作者：lq。
-                    .when(hidden_only, |row| {
-                        row.child(
-                            Button::new(SharedString::from(format!("show-hidden-{}", side.id())))
-                                .ghost()
-                                .xsmall()
-                                .label("显示隐藏文件")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.services.show_hidden = true;
-                                    this.rebuild_tree(FileSide::Local, cx);
-                                    this.rebuild_tree(FileSide::Remote, cx);
-                                    cx.notify();
                                 })),
                         )
                     })
@@ -893,31 +737,34 @@ impl ServerWorkspace {
                             );
                         });
                     })
-                    .child(if browser.show_directories {
-                        h_resizable(SharedString::from(format!("file-navigation-{}", side.id())))
-                            .child(
-                                resizable_panel()
-                                    .size(px(145.))
-                                    .size_range(px(85.)..px(320.))
-                                    .child(
-                                        div()
-                                            .size_full()
-                                            .min_h_0()
-                                            .overflow_hidden()
-                                            .border_r_1()
-                                            .border_color(cx.theme().border)
-                                            .child(directories),
-                                    ),
-                            )
-                            .child(
-                                resizable_panel()
-                                    .size_range(px(140.)..Pixels::MAX)
-                                    .child(files),
-                            )
-                            .into_any_element()
-                    } else {
-                        files
-                    }),
+                    // 功能：双列表模式不显示树；隐藏本地后在远程路径栏下提供目录树与列表；时间：2026-11-12；作者：lq。
+                    .child(
+                        if side == FileSide::Remote && !self.services.files.show_local {
+                            h_resizable("remote-navigation-split")
+                                .child(
+                                    resizable_panel()
+                                        .size(px(180.))
+                                        .size_range(px(110.)..px(320.))
+                                        .child(
+                                            div()
+                                                .size_full()
+                                                .min_h_0()
+                                                .overflow_hidden()
+                                                .border_r_1()
+                                                .border_color(cx.theme().border)
+                                                .child(self.remote_directory_tree(cx)),
+                                        ),
+                                )
+                                .child(
+                                    resizable_panel()
+                                        .size_range(px(140.)..Pixels::MAX)
+                                        .child(files),
+                                )
+                                .into_any_element()
+                        } else {
+                            files
+                        },
+                    ),
             )
             .child(
                 div()
@@ -974,14 +821,36 @@ impl ServerWorkspace {
                     .border_color(cx.theme().border)
                     .child(div().text_xs().font_semibold().child("SFTP 文件"))
                     .child(div().flex_1())
+                    // 功能：本地开关提供远程全宽模式，重新显示时保留路径与选择；时间：2026-11-12；作者：lq。
+                    .child(
+                        Button::new("toggle-local-files")
+                            .ghost()
+                            .xsmall()
+                            .icon(UiIcon::Columns2)
+                            .label(if files.show_local {
+                                "隐藏本地"
+                            } else {
+                                "显示本地"
+                            })
+                            .tooltip(format!(
+                                "切换本地列表 · 下载目录：{}",
+                                files.local.current.display()
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.services.files.show_local = !this.services.files.show_local;
+                                this.sync_remote_tree(window, cx);
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         Checkbox::new("show-hidden")
                             .label("显示隐藏文件")
                             .checked(self.services.show_hidden)
                             .on_click(cx.listener(|this, checked: &bool, _, cx| {
                                 this.services.show_hidden = *checked;
-                                this.rebuild_tree(FileSide::Local, cx);
-                                this.rebuild_tree(FileSide::Remote, cx);
+                                this.refresh_file_selection(FileSide::Local);
+                                this.refresh_file_selection(FileSide::Remote);
+                                this.rebuild_remote_tree(false, cx);
                                 cx.notify();
                             })),
                     )
@@ -1037,21 +906,23 @@ impl ServerWorkspace {
                         ),
                 )
             })
-            .child(
-                div().flex_1().min_h_0().child(
-                    h_resizable("server-file-split")
-                        .child(
-                            resizable_panel()
-                                .size_range(px(180.)..Pixels::MAX)
-                                .child(self.browser_panel(FileSide::Local, cx)),
-                        )
-                        .child(
-                            resizable_panel()
-                                .size_range(px(180.)..Pixels::MAX)
-                                .child(self.browser_panel(FileSide::Remote, cx)),
-                        ),
-                ),
-            )
+            .child(div().flex_1().min_h_0().child(if files.show_local {
+                h_resizable("server-file-split")
+                    .child(
+                        resizable_panel()
+                            .size_range(px(180.)..Pixels::MAX)
+                            .child(self.browser_panel(FileSide::Local, cx)),
+                    )
+                    .child(
+                        resizable_panel()
+                            .size_range(px(180.)..Pixels::MAX)
+                            .child(self.browser_panel(FileSide::Remote, cx)),
+                    )
+                    .into_any_element()
+            } else {
+                // 功能：隐藏本地后远程占满文件区，内部切换为目录树与文件列表；时间：2026-11-12；作者：lq。
+                self.browser_panel(FileSide::Remote, cx)
+            }))
             .child(
                 h_flex()
                     .id("transfer-status")
@@ -1083,7 +954,7 @@ impl ServerWorkspace {
                             })
                             .child(status),
                     )
-                    // 功能：队列和最近结果收进菜单，避免挤压文件树；时间：2026-11-11；作者：lq。
+                    // 功能：队列和最近结果收进菜单，避免挤压文件列表；时间：2026-11-11；作者：lq。
                     .child(
                         Button::new("transfer-history")
                             .ghost()
@@ -1169,6 +1040,7 @@ impl ServerWorkspace {
 
     /// 功能：地址栏回车与刷新采用同一跳转逻辑；时间：2026-11-11；作者：lq。
     pub(super) fn subscribe_file_paths(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.subscribe_remote_tree(window, cx);
         for (side, input) in [
             (FileSide::Local, &self.services.local_directory),
             (FileSide::Remote, &self.services.remote_path),
@@ -1185,7 +1057,7 @@ impl ServerWorkspace {
         }
     }
 
-    /// 功能：使用系统文件夹选择器切换本地树根，取消时保留当前目录；时间：2026-11-11；作者：lq。
+    /// 功能：使用系统文件夹选择器跳转本地目录，取消时保留当前目录；时间：2026-11-11；作者：lq。
     fn choose_local_directory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: false,

@@ -1,6 +1,6 @@
-//! 功能：文件管理器式目录树、详情表格和当前层级批量传输；时间：2026-11-11；作者：lq。
+//! 功能：双列表目录导航、详情表格和当前层级批量传输；时间：2026-11-12；作者：lq。
 use super::*;
-use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
+use gpui_kit::component::scroll::{ScrollableMask, Scrollbar, ScrollbarMode};
 
 impl FileBrowser {
     /// 功能：详情列表仅列出当前目录直接子项，隐藏过滤同时约束多选范围；时间：2026-11-11；作者：lq。
@@ -89,7 +89,7 @@ impl FileBrowser {
 }
 
 impl ServerWorkspace {
-    /// 功能：进入目录时保留已知祖先树、更新地址并清空跨层级选择；时间：2026-11-11；作者：lq。
+    /// 功能：进入目录时更新地址并清空跨层级选择；时间：2026-11-12；作者：lq。
     pub(super) fn navigate_directory(
         &mut self,
         side: FileSide,
@@ -98,26 +98,16 @@ impl ServerWorkspace {
         cx: &mut Context<Self>,
     ) {
         let browser = self.services.files.browser_mut(side);
-        if !path.starts_with(&browser.root) || browser.root.as_os_str().is_empty() {
-            browser.generation += 1;
-            browser.root = path.clone();
-            browser.entries.clear();
-            browser.expanded.clear();
-            browser.errors.clear();
-            browser.loading.clear();
-        }
+        // 功能：切换目录使旧后台结果失效，并释放上一层缓存；时间：2026-11-12；作者：lq。
+        browser.generation += 1;
+        browser.entries.clear();
+        browser.errors.clear();
+        browser.loading.clear();
         browser.current = path.clone();
         browser.selection.clear();
         browser.selected = None;
         browser.anchor = None;
         browser.scroll.scroll_to_item(0, ScrollStrategy::Top);
-        // 功能：逐级展开已知祖先，目录列表进入下层时左树仍保留上下文；时间：2026-11-11；作者：lq。
-        for ancestor in path
-            .ancestors()
-            .take_while(|p| p.starts_with(&browser.root))
-        {
-            browser.expanded.insert(ancestor.to_path_buf());
-        }
         let input = if side == FileSide::Local {
             &self.services.local_directory
         } else {
@@ -127,7 +117,6 @@ impl ServerWorkspace {
             input.set_value(path.display().to_string(), window, cx)
         });
         self.load_directory(side, path, window, cx);
-        self.rebuild_tree(side, cx);
         cx.notify();
     }
 
@@ -185,107 +174,7 @@ impl ServerWorkspace {
         cx.notify();
     }
 
-    /// 功能：左树只呈现文件夹，单击目录定位右侧内容，箭头独立展开子目录；时间：2026-11-11；作者：lq。
-    pub(super) fn directory_tree(&self, side: FileSide, cx: &mut Context<Self>) -> AnyElement {
-        let state = self.services.files.browser(side).tree.clone();
-        let view = cx.entity();
-        tree(&state, move |index, node, _, _, _cx| {
-            let path = PathBuf::from(node.item().id.as_str());
-            let valid = !node.item().id.starts_with("qds6-placeholder:");
-            let expanded = node.is_expanded();
-            let toggle_view = view.clone();
-            let toggle_path = path.clone();
-            let click_view = view.clone();
-            let drop_view = view.clone();
-            let owner = view.entity_id();
-            let destination = path.clone();
-            ListItem::new((
-                if side == FileSide::Local {
-                    "local-directory"
-                } else {
-                    "remote-directory"
-                },
-                index,
-            ))
-            .h(px(28.))
-            .py_0()
-            .pl(px(4. + node.depth() as f32 * 12.))
-            .pr_1()
-            .child(
-                h_flex()
-                    .gap_1()
-                    .min_w_0()
-                    .w_full()
-                    .child(
-                        div()
-                            .id((
-                                SharedString::from(format!("directory-toggle-{}", side.id())),
-                                index,
-                            ))
-                            .w(px(14.))
-                            .flex_shrink_0()
-                            .when(valid, |v| {
-                                v.child(
-                                    Icon::new(if expanded {
-                                        UiIcon::ChevronDown
-                                    } else {
-                                        UiIcon::ChevronRight
-                                    })
-                                    .xsmall(),
-                                )
-                                .on_click(move |_, window, cx| {
-                                    cx.stop_propagation();
-                                    toggle_view.update(cx, |this, cx| {
-                                        this.toggle_directory(side, toggle_path.clone(), window, cx)
-                                    });
-                                })
-                            }),
-                    )
-                    .when(valid, |v| v.child(Icon::new(UiIcon::Folder).small()))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .text_xs()
-                            .text_ellipsis()
-                            .child(node.item().label.clone()),
-                    ),
-            )
-            .when(valid, |v| {
-                v.on_click(move |_, window, cx| {
-                    cx.stop_propagation();
-                    click_view.update(cx, |this, cx| {
-                        this.navigate_directory(side, path.clone(), window, cx)
-                    });
-                })
-                // 功能：目录导航树同样接受对侧整组文件，精确落入被指向的文件夹；时间：2026-11-11；作者：lq。
-                .can_drop(move |data, _, _| {
-                    data.downcast_ref::<FileDrag>()
-                        .is_some_and(|d| d.owner == owner && d.side != side)
-                })
-                .drag_over::<FileDrag>(|style, _, _, cx| {
-                    style
-                        .bg(cx.theme().accent)
-                        .border_1()
-                        .border_color(cx.theme().primary)
-                })
-                .on_drop(move |drag: &FileDrag, window, cx| {
-                    cx.stop_propagation();
-                    drop_view.update(cx, |this, cx| {
-                        this.enqueue_batch(
-                            drag.side,
-                            drag.entries.borrow().clone(),
-                            destination.clone(),
-                            window,
-                            cx,
-                        )
-                    });
-                })
-            })
-        })
-        .into_any_element()
-    }
-
-    /// 功能：虚拟化当前目录详情，固定列宽并允许横向滚动，避免长属性挤压文件名；时间：2026-11-11；作者：lq。
+    /// 功能：虚拟化详情，文件名吸收额外宽度，属性可横向滚动；时间：2026-11-12；作者：lq。
     pub(super) fn directory_list(&self, side: FileSide, cx: &mut Context<Self>) -> AnyElement {
         let browser = self.services.files.browser(side);
         let count = browser.visible_entries(self.services.show_hidden).len();
@@ -296,9 +185,10 @@ impl ServerWorkspace {
             .border_color(cx.theme().border)
             .text_xs()
             .text_color(cx.theme().muted_foreground)
+            // 功能：文件名列优先扩展，表头与数据行保持相同伸缩规则；时间：2026-11-12；作者：lq。
+            .child(div().flex_1().min_w(px(240.)).px_2().child("文件名"))
             .children(
                 [
-                    ("文件名", 240.),
                     ("大小", 85.),
                     ("类型", 100.),
                     ("修改时间", 155.),
@@ -329,10 +219,14 @@ impl ServerWorkspace {
                 side.id()
             )))
             .test_support()
-            .size_full()
-            .overflow_x_scroll()
+            // 功能：仅裁切并应用横向手动滚动偏移，禁止将纵向滚轮转换成横向；时间：2026-11-12；作者：lq。
+            .absolute()
+            .top_0()
+            .left_0()
+            .right(px(16.))
+            .bottom(px(16.))
+            .overflow_hidden()
             .track_scroll(&browser.horizontal)
-            .pb(px(12.))
             .track_focus(&focus)
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                 let key = &event.keystroke;
@@ -374,6 +268,29 @@ impl ServerWorkspace {
                                 .text_color(cx.theme().muted_foreground)
                                 .child(
                                     browser.empty_hint(&browser.current, self.services.show_hidden),
+                                )
+                                // 功能：仅隐藏项的快捷入口放在空态内，避免挤压窄栏上传下载；时间：2026-11-12；作者：lq。
+                                .when(
+                                    !self.services.show_hidden
+                                        && browser.hidden_count(&browser.current) > 0,
+                                    |v| {
+                                        v.child(
+                                            Button::new(SharedString::from(format!(
+                                                "show-hidden-{}",
+                                                side.id()
+                                            )))
+                                            .ghost()
+                                            .xsmall()
+                                            .label("显示隐藏文件")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.services.show_hidden = true;
+                                                this.refresh_file_selection(FileSide::Local);
+                                                this.refresh_file_selection(FileSide::Remote);
+                                                this.rebuild_remote_tree(false, cx);
+                                                cx.notify();
+                                            })),
+                                        )
+                                    },
                                 ),
                         )
                     })
@@ -384,7 +301,58 @@ impl ServerWorkspace {
             .relative()
             .size_full()
             .child(content)
-            .child(Scrollbar::horizontal(&browser.horizontal).mode(ScrollbarMode::Always))
+            // 功能：滚轮在整个列表视口（含表头）只控制纵向，横向仅通过底部条手动调整；时间：2026-11-12；作者：lq。
+            .child(
+                ScrollableMask::new(Axis::Vertical, &browser.scroll).id(SharedString::from(
+                    format!("file-vertical-wheel-{}", side.id()),
+                )),
+            )
+            // 功能：纵向滚动条固定在可见区域右侧，不随宽表格横移，排除表头和底部横条；时间：2026-11-12；作者：lq。
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "file-vertical-track-{}",
+                        side.id()
+                    )))
+                    .test_support()
+                    .absolute()
+                    .top(px(26.))
+                    .bottom(px(16.))
+                    .right_0()
+                    .w(px(16.))
+                    .child(
+                        Scrollbar::vertical(&browser.scroll)
+                            .id(SharedString::from(format!(
+                                "file-vertical-bar-{}",
+                                side.id()
+                            )))
+                            .viewport_from_layout()
+                            .mode(ScrollbarMode::Always),
+                    ),
+            )
+            // 功能：横向条独占底部空间，与纵向条互不遮挡；时间：2026-11-12；作者：lq。
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "file-horizontal-track-{}",
+                        side.id()
+                    )))
+                    .test_support()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right(px(16.))
+                    .h(px(16.))
+                    .child(
+                        Scrollbar::horizontal(&browser.horizontal)
+                            .id(SharedString::from(format!(
+                                "file-horizontal-bar-{}",
+                                side.id()
+                            )))
+                            .viewport_from_layout()
+                            .mode(ScrollbarMode::Always),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -428,8 +396,9 @@ impl ServerWorkspace {
                         index,
                     ))
                     .test_support()
-                    .w(px(240.))
-                    .flex_shrink_0()
+                    // 功能：单侧全宽时新增空间优先分配给文件名；时间：2026-11-12；作者：lq。
+                    .flex_1()
+                    .min_w(px(240.))
                     .px_2()
                     .gap_1()
                     .overflow_hidden()
