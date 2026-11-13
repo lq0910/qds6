@@ -18,17 +18,51 @@ use zeroize::Zeroizing;
 #[cfg(all(test, feature = "ui-tests"))]
 mod private_key_tests;
 
-/// 功能：结果网格真实数据源，Kit 仅绘制可见范围；时间：2026-11-10；作者：lq。
-pub(super) struct QueryRows(ResultSet);
+/// 功能：结果网格真实数据源，支持本地行内编辑；时间：2026-11-13；作者：lq。
+pub(super) struct QueryRows {
+    pub data: ResultSet,
+    // 功能：当前正在编辑的单元格坐标，失焦后写回 data；时间：2026-11-13；作者：lq。
+    pub editing: Option<(usize, usize)>,
+    pub editor: Entity<InputState>,
+    // 功能：持有编辑器失焦订阅，防止重复注册；时间：2026-11-13；作者：lq。
+    blur_subscription: Option<Subscription>,
+}
+
+impl QueryRows {
+    pub fn new(data: ResultSet, window: &mut Window, cx: &mut App) -> Self {
+        Self {
+            data,
+            editing: None,
+            editor: cx.new(|cx| InputState::new(window, cx)),
+            blur_subscription: None,
+        }
+    }
+
+    /// 功能：提交编辑内容到本地数据，不发起数据库 UPDATE；时间：2026-11-13；作者：lq。
+    fn commit_edit(&mut self, cx: &App) {
+        if let Some((row, col)) = self.editing.take() {
+            if let Some(cell) = self
+                .data
+                .rows
+                .get_mut(row)
+                .and_then(|r| r.get_mut(col))
+            {
+                let text = self.editor.read(cx).value().to_string();
+                *cell = qds6_services::database::Cell::Text(text);
+            }
+        }
+    }
+}
+
 impl TableDelegate for QueryRows {
     fn columns_count(&self, _: &App) -> usize {
-        self.0.columns.len()
+        self.data.columns.len()
     }
     fn rows_count(&self, _: &App) -> usize {
-        self.0.rows.len()
+        self.data.rows.len()
     }
     fn column(&self, col: usize, _: &App) -> Column {
-        Column::new(format!("result-{col}"), self.0.columns[col].clone())
+        Column::new(format!("result-{col}"), self.data.columns[col].clone())
             .width(px(180.))
             .min_width(px(64.))
             .sortable()
@@ -42,7 +76,7 @@ impl TableDelegate for QueryRows {
         _: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) {
-        self.0.rows.sort_by(|a, b| {
+        self.data.rows.sort_by(|a, b| {
             let order = a[col].display().cmp(&b[col].display());
             if sort == ColumnSort::Descending {
                 order.reverse()
@@ -60,19 +94,63 @@ impl TableDelegate for QueryRows {
     ) -> impl IntoElement {
         div()
             .text_color(cx.theme().foreground)
-            .child(self.0.columns[col].clone())
+            .child(self.data.columns[col].clone())
     }
+
+    /// 功能：单元格双击进入编辑模式，编辑器失焦后提交到本地缓存；时间：2026-11-13；作者：lq。
     fn render_td(
         &mut self,
         row: usize,
         col: usize,
-        _: &mut Window,
-        _: &mut Context<TableState<Self>>,
+        window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        div().child(self.0.rows[row][col].display())
+        // 功能：通过 TableState 数据源提交失焦编辑；时间：2026-11-13；作者：lq。
+        if self.blur_subscription.is_none() {
+            let focus = self.editor.read(cx).focus_handle(cx);
+            self.blur_subscription = Some(cx.on_blur(&focus, window, |table, _, cx| {
+                table.delegate_mut().commit_edit(cx);
+                cx.notify();
+            }));
+        }
+        if self.editing == Some((row, col)) {
+            // 功能：编辑模式：嵌入 Input，失焦时提交；时间：2026-11-13；作者：lq。
+            let editor = self.editor.clone();
+            div()
+                .size_full()
+                .child(
+                    Input::new(&editor).xsmall(),
+                )
+                .into_any_element()
+        } else {
+            let display = self.data.rows[row][col].display();
+            let editor = self.editor.clone();
+            div()
+                .size_full()
+                .cursor_text()
+                .child(display.clone())
+                // 功能：双击进入编辑，单击保持选中；时间：2026-11-13；作者：lq。
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        if event.click_count == 2 {
+                            // 功能：先提交上一个单元格的编辑；时间：2026-11-13；作者：lq。
+                            let data = this.delegate_mut();
+                            data.commit_edit(cx);
+                            data.editing = Some((row, col));
+                            let init = data.data.rows[row][col].display();
+                            editor.update(cx, |s, cx| s.set_value(init, window, cx));
+                            // 功能：进入编辑时聚焦输入框以接收键盘与失焦事件；时间：2026-11-13；作者：lq。
+                            window.focus(&editor.read(cx).focus_handle(cx), cx);
+                            cx.notify();
+                        }
+                    }),
+                )
+                .into_any_element()
+        }
     }
     fn cell_label(&self, row: usize, col: usize, _: &App) -> Option<SharedString> {
-        Some(self.0.rows[row][col].display().into())
+        Some(self.data.rows[row][col].display().into())
     }
 }
 
@@ -97,6 +175,13 @@ pub(super) struct ServiceUi {
     selected_result: usize,
     tables: Vec<Table>,
     selected_table: Option<usize>,
+    // 功能：目录滚动和属性独立于表网格，向导捕获目标连接；时间：2026-11-12；作者：lq。
+    object_scroll: ScrollHandle,
+    catalog_vertical: ScrollHandle,
+    catalog_horizontal: ScrollHandle,
+    table_properties:
+        std::collections::HashMap<(String, String), qds6_services::database::TableProperties>,
+    transfer: Option<database_ui::actions::TransferWizard>,
     // 功能：数据库对象页与多表标签独立于 SQL 草稿；时间：2026-11-11；作者：lq。
     table_tabs: Vec<table_grid::TableTab>,
     active_table_tab: Option<usize>,
@@ -113,6 +198,9 @@ pub(super) struct ServiceUi {
     // 功能：CSV 导出路径独立于 SFTP，本地路径不再跨任务复用；时间：2026-11-11；作者：lq。
     show_csv_export: bool,
     csv_path: Entity<InputState>,
+    // 功能：Excel 导出路径与 CSV 独立，格式不同不复用；时间：2026-11-13；作者：lq。
+    pub(super) show_xlsx_export: bool,
+    pub(super) xlsx_path: Entity<InputState>,
     backup_path: Entity<InputState>,
     backup_password: Entity<InputState>,
     preview: Option<Configuration>,
@@ -173,6 +261,11 @@ impl ServiceUi {
             selected_result: 0,
             tables: Vec::new(),
             selected_table: None,
+            object_scroll: ScrollHandle::new(),
+            catalog_vertical: ScrollHandle::new(),
+            catalog_horizontal: ScrollHandle::new(),
+            table_properties: Default::default(),
+            transfer: None,
             edit_column: cx
                 .new(|cx| InputState::new(window, cx).placeholder("新增 / 删除字段名称")),
             edit_value: cx.new(|cx| InputState::new(window, cx).placeholder("新建 / 重命名表名称")),
@@ -186,6 +279,8 @@ impl ServiceUi {
             show_database_tools: false,
             show_csv_export: false,
             csv_path: cx.new(|cx| InputState::new(window, cx).placeholder("CSV 保存文件绝对路径")),
+            show_xlsx_export: false,
+            xlsx_path: cx.new(|cx| InputState::new(window, cx).placeholder("Excel 保存文件绝对路径（.xlsx）")),
             backup_path,
             backup_password,
             preview: None,
@@ -644,6 +739,8 @@ impl Workbench {
                     this.status = "服务器已连接 · 上方终端，下方本地与远程文件".into();
                 }
                 Connected::Database(database, profile) => {
+                    this.services.transfer = None;
+                    this.services.table_properties.clear();
                     this.services.database_profile = Some(profile);
                     this.area = workspace_ui::WorkspaceArea::Databases;
                     this.services.database = Some(Arc::new(database));
@@ -750,7 +847,7 @@ impl Workbench {
                     .sets
                     .first()
                     .filter(|s| !s.columns.is_empty())
-                    .map(|set| cx.new(|cx| TableState::new(QueryRows(set.clone()), window, cx)));
+                    .map(|set| cx.new(|cx| TableState::new(QueryRows::new(set.clone(), window, cx), window, cx)));
                 this.services.results = Some(result);
                 this.services.selected_result = 0;
                 // 功能：查询结果留在当前 SQL 编辑区，后台完成不抢走其他标签；时间：2026-11-11；作者：lq。
@@ -812,9 +909,11 @@ impl Workbench {
             move || {
                 let tables = database.tables()?;
                 let context = database.connection_context()?;
-                Ok((tables, context))
+                let properties = database.table_properties()?;
+                Ok((tables, context, properties))
             },
-            |this, (tables, context), _, _| {
+            |this, (tables, context, properties), _, _| {
+                this.services.table_properties = properties;
                 this.services.database_context = context;
                 let selected = this
                     .services
@@ -828,6 +927,13 @@ impl Workbench {
                         .iter()
                         .position(|t| t.schema == old.schema && t.name == old.name)
                 });
+                // 功能：表名列表同步到 SQL 编辑器补全提供者，使用 schema.name 格式；时间：2026-11-13；作者：lq。
+                this.sql_tables.set(
+                    this.services
+                        .tables
+                        .iter()
+                        .map(|t| format!("{}.{}", t.schema, t.name)),
+                );
                 this.status = format!("{} 个数据库对象", this.services.tables.len()).into();
             },
             window,
@@ -903,7 +1009,8 @@ pub use smoke::run_service_ui_smoke;
 mod backup_ui;
 
 // 功能：数据库对象和查询结果的统一布局；时间：2026-11-11；作者：lq。
-mod database_ui;
+// 功能：允许工作台注册数据库补全提供者；时间：2026-11-13；作者：lq。
+pub(crate) mod database_ui;
 
 // 功能：布局样例只在显式验收构建中可用，不进入发行程序；时间：2026-11-11；作者：lq。
 #[cfg(feature = "ui-tests")]

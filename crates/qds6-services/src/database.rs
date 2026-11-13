@@ -3,6 +3,9 @@
 // 功能：导出原生表数据网格服务；时间：2026-11-11；作者：lq。
 mod grid;
 pub use grid::{BrowseRequest, FilterOp, GridColumn, GridFilter, PAGE_SIZE, RowChange, TablePage};
+// 功能：对象属性、表级文件交换与 SQL 转储；时间：2026-11-12；作者：lq。
+mod transfer;
+pub use transfer::{TableProperties, TransferFormat, read_import};
 
 use futures_util::TryStreamExt;
 use qds6_core::{ConnectionProfile, Protocol, TlsMode};
@@ -288,6 +291,66 @@ impl DatabaseSession {
             session_transaction_mode: AtomicBool::new(false),
             _tunnel: tunnel,
         })
+    }
+
+    /// 功能：表设计直接保存，拒绝混入手动事务，PostgreSQL 失败显式回滚；时间：2026-11-13；作者：lq。
+    pub fn save_structure(
+        &self,
+        table: &Table,
+        expected: &[GridColumn],
+        sql: &str,
+    ) -> Result<(), String> {
+        if self.grid_columns(table)? != expected {
+            return Err("表结构已变化，请保留草稿并重新读取结构".into());
+        }
+        if self.closed.load(Ordering::SeqCst) {
+            return Err("连接已失效，请重新连接".into());
+        }
+        if self.raw_transaction.load(Ordering::SeqCst)
+            || self.session_transaction_mode.load(Ordering::SeqCst)
+        {
+            return Err("请先结束手动事务；修改过 autocommit 的连接需重连后保存表设计".into());
+        }
+        let mut conn = self.connection.try_lock().map_err(|_| "已有查询正在执行")?;
+        self.runtime
+            .as_ref()
+            .expect("live runtime")
+            .block_on(async {
+                match &mut *conn {
+                    Adapter::Pg(conn) => {
+                        if conn.is_in_transaction() {
+                            return Err("请先结束手动事务".into());
+                        }
+                        let mut tx = conn.begin().await.map_err(safe_error)?;
+                        if let Err(error) = sqlx::raw_sql(sql).execute(&mut *tx).await {
+                            if tx.rollback().await.is_err() {
+                                self.closed.store(true, Ordering::SeqCst);
+                                return Err(
+                                    "表设计保存失败且回滚失败，请重新连接并检查表结构".into()
+                                );
+                            }
+                            return Err(safe_error(error));
+                        }
+                        // 功能：DDL 改变 SELECT * 的返回结构，提交前清除旧预编译结果描述；时间：2026-11-13；作者：lq。
+                        tx.clear_cached_statements().await.map_err(safe_error)?;
+                        tx.commit().await.map_err(safe_error)?;
+                    }
+                    Adapter::MySql(conn) => {
+                        if conn.is_in_transaction() {
+                            return Err("请先结束手动事务".into());
+                        }
+                        // 功能：MySQL DDL 会隐式提交，错误明确提示先核对已执行的结构；时间：2026-11-13；作者：lq。
+                        sqlx::raw_sql(sql).execute(&mut *conn).await.map_err(|e| {
+                            format!(
+                                "{}；MySQL 可能已保存部分结构，请核对并重新读取结构后重试",
+                                safe_error(e)
+                            )
+                        })?;
+                        conn.clear_cached_statements().await.map_err(safe_error)?;
+                    }
+                }
+                Ok(())
+            })
     }
 
     /// 功能：执行任意 SQL，结果总计 10000 行/16 MiB；达到上限真实取消服务端；时间：2026-11-10；作者：lq。
@@ -672,6 +735,31 @@ pub fn csv(result: &ResultSet) -> Vec<u8> {
         output.push_str("\r\n");
     }
     output.into_bytes()
+}
+
+/// 功能：将查询结果集导出为 Excel xlsx 格式，列标题在首行，数据从第二行起；时间：2026-11-13；作者：lq。
+pub fn xlsx(result: &ResultSet) -> Result<Vec<u8>, String> {
+    use rust_xlsxwriter::Workbook;
+    let io_error = |e: rust_xlsxwriter::XlsxError| format!("xlsx 写入失败：{e}");
+    let mut workbook = Workbook::new();
+    let worksheet = workbook.add_worksheet();
+    for (col_idx, col_name) in result.columns.iter().enumerate() {
+        worksheet
+            .write_string(0, col_idx as u16, col_name)
+            .map_err(io_error)?;
+    }
+    for (row_idx, row) in result.rows.iter().enumerate() {
+        for (col_idx, cell) in row.iter().enumerate() {
+            let text = match cell {
+                Cell::Null => String::new(),
+                _ => cell.display(),
+            };
+            worksheet
+                .write_string((row_idx + 1) as u32, col_idx as u16, &text)
+                .map_err(io_error)?;
+        }
+    }
+    workbook.save_to_buffer().map_err(io_error)
 }
 
 // 功能：回归握手错误分类与诊断脱敏，不发起外部网络请求；时间：2026-11-11；作者：lq。

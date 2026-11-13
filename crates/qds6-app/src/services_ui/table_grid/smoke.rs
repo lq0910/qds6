@@ -3,6 +3,8 @@ use super::*;
 use gpui_kit::InputEvent as _;
 use gpui_kit::test::{TestQueryExt, TestWindowExt};
 use std::time::{Duration, Instant};
+// 功能：目录、查询滚动和文件向导专项验收；时间：2026-11-12；作者：lq。
+mod transfer;
 
 /// 功能：等待真实后台任务并推动原生帧，不以虚拟时钟替代网络任务；时间：2026-11-11；作者：lq。
 fn settle(cx: &mut HeadlessAppContext, handle: AnyWindowHandle, view: &Entity<Workbench>) {
@@ -46,7 +48,7 @@ pub fn run_database_grid_smoke() {
     profile.database = "qds6".into();
     profile.db.tls = TlsMode::Disabled;
     let db = DatabaseSession::connect(&profile, "qds6-fixture-only", None).unwrap();
-    db.query("DROP TABLE IF EXISTS public.ui_grid_a; DROP TABLE IF EXISTS public.ui_grid_b; CREATE TABLE public.ui_grid_a(id INT PRIMARY KEY, name TEXT, quantity INT DEFAULT 1); INSERT INTO public.ui_grid_a VALUES (1,'北京',10),(2,'上海',20); CREATE TABLE public.ui_grid_b(id INT PRIMARY KEY, name TEXT); INSERT INTO public.ui_grid_b VALUES(1,'第二张表')").unwrap();
+    db.query("DROP TABLE IF EXISTS public.aa_transfer_fixture; DROP TABLE IF EXISTS public.aa_transfer_fixture_copy; DROP TABLE IF EXISTS public.aa_transfer_renamed; DROP TABLE IF EXISTS public.ui_grid_a; DROP TABLE IF EXISTS public.ui_grid_b; CREATE TABLE public.ui_grid_a(id INT PRIMARY KEY, name TEXT, quantity INT DEFAULT 1); INSERT INTO public.ui_grid_a VALUES (1,'北京',10),(2,'上海',20); CREATE TABLE public.ui_grid_b(id INT PRIMARY KEY, name TEXT); INSERT INTO public.ui_grid_b VALUES(1,'第二张表')").unwrap();
     // 功能：宽表、中文备注与长对象列表复现用户截图问题；时间：2026-11-12；作者：lq。
     db.query("COMMENT ON COLUMN public.ui_grid_a.name IS '客户名称备注'; COMMENT ON COLUMN public.ui_grid_b.name IS '宽表名称';").unwrap();
     for i in 0..16 {
@@ -517,7 +519,7 @@ pub fn run_database_grid_smoke() {
         .unwrap()
         .save("output/database-grid/filter-builder-1440.png")
         .unwrap();
-    // 功能：设计字段备注、索引和增量 DDL 预览，不自动修改测试表；时间：2026-11-12；作者：lq。
+    // 功能：验证直接保存的数据库失败保留草稿、重试成功及不切换查询页；时间：2026-11-13；作者：lq。
     cx.update_window(handle, |_, window, cx| {
         window.click("grid-design", cx);
         window.click(("design-column", 1usize), cx);
@@ -542,35 +544,44 @@ pub fn run_database_grid_smoke() {
         window.click("design-input-1-5", cx);
         window.press("cmd-a", cx);
         window.input("修改后的字段备注", cx);
-        view.update(cx, |this, _| this.sql_dirty = false);
-        window.click("design-preview", cx);
+        window.click("design-input-1-4", cx);
+        window.press("cmd-a", cx);
+        window.input("qds6_missing_function()", cx);
+        window.click("design-save", cx);
     })
     .unwrap();
     settle(&mut cx, handle, &view);
     cx.update(|cx| {
-        let sql = view.read(cx).sql.read(cx).value();
-        assert!(sql.contains("COMMENT ON COLUMN") && sql.contains("修改后的字段备注"));
-        assert!(
-            !sql.contains(" TYPE "),
-            "unchanged column type was rewritten"
-        );
+        let this = view.read(cx);
+        assert!(this.error && this.services.table_tabs[1].has_changes(cx));
+        assert!(!this.services.query_active);
     });
-    assert_eq!(
-        db.grid_columns(&Table {
-            schema: "public".into(),
-            name: "ui_grid_b".into(),
-            kind: "BASE TABLE".into()
-        })
-        .unwrap()[1]
-            .comment,
-        "宽表名称"
-    );
+    let target = Table {
+        schema: "public".into(),
+        name: "ui_grid_b".into(),
+        kind: "BASE TABLE".into(),
+    };
+    assert_eq!(db.grid_columns(&target).unwrap()[1].comment, "宽表名称");
     cx.update_window(handle, |_, window, cx| {
-        window.within("database-table-tabs").click(2usize, cx);
+        window.click("design-input-1-4", cx);
+        window.press("cmd-a", cx);
+        window.press("backspace", cx);
+        window.click("design-save", cx);
     })
     .unwrap();
     settle(&mut cx, handle, &view);
-    // 功能：真实事件验证插入行、预置类型、长度精度、非空和多行统一预览；时间：2026-11-12；作者：lq。
+    cx.update(|cx| {
+        let this = view.read(cx);
+        assert!(!this.error, "{}", this.status);
+        assert!(!this.services.query_active);
+        assert!(this.services.table_tabs[1].designing);
+        assert!(!this.services.table_tabs[1].has_changes(cx));
+    });
+    assert_eq!(
+        db.grid_columns(&target).unwrap()[1].comment,
+        "修改后的字段备注"
+    );
+    // 功能：真实事件验证插入、类型参数、非空和批量结构直接保存；时间：2026-11-13；作者：lq。
     cx.update_window(handle, |_, window, cx| {
         window.click("design-new-column", cx);
     })
@@ -615,21 +626,36 @@ pub fn run_database_grid_smoke() {
     settle(&mut cx, handle, &view);
     cx.update_window(handle, |_, window, cx| {
         view.update(cx, |this, _| this.sql_dirty = false);
-        window.click("design-preview", cx);
+        window.click("design-save", cx);
     })
     .unwrap();
     settle(&mut cx, handle, &view);
     cx.update(|cx| {
-        let sql = view.read(cx).sql.read(cx).value();
-        assert!(
-            sql.contains("ADD COLUMN \"amount\" numeric(12,2) NOT NULL DEFAULT 0"),
-            "{sql}"
-        );
-        assert!(sql.contains("DROP COLUMN \"field_15\";"));
-        assert!(sql.contains("修改后的字段备注") && sql.contains("金额") && sql.contains("BEGIN;"));
+        let this = view.read(cx);
+        assert!(!this.error, "{}", this.status);
+        assert!(!this.services.query_active);
+        assert!(!this.services.table_tabs[1].has_changes(cx));
     });
+    let columns = db.grid_columns(&target).unwrap();
+    assert!(!columns.iter().any(|c| c.name == "field_15"));
+    let amount = columns.iter().find(|c| c.name == "amount").unwrap();
+    assert!(amount.data_type.contains("12,2"));
+    assert!(!amount.nullable);
+    assert_eq!(amount.comment, "金额");
     cx.update_window(handle, |_, window, cx| {
-        window.within("database-table-tabs").click(2usize, cx);
+        // 功能：保存刷新重置滚动位置后，先滚到操作列再验证关闭保护；时间：2026-11-13；作者：lq。
+        window.scroll(
+            "design-column-list",
+            ScrollDelta::Pixels(point(px(0.), px(-2000.))),
+            cx,
+        );
+        window.scroll(
+            "design-horizontal-viewport",
+            ScrollDelta::Pixels(point(px(-2000.), px(0.))),
+            cx,
+        );
+        window.render_frame(cx);
+        window.click(("design-delete-row", 17usize), cx);
         window.click(("close-table", 1usize), cx);
     })
     .unwrap();
@@ -775,6 +801,7 @@ pub fn run_database_grid_smoke() {
         .unwrap()
         .save("output/database-grid/catalog-scrolled.png")
         .unwrap();
+    transfer::check(&mut cx, handle, &view, &db, &root);
     cx.update_window(handle, |_, window, cx| {
         window.click("database-new-query", cx);
         assert!(window.find("run-sql").visible());
@@ -827,7 +854,7 @@ pub fn run_database_grid_smoke() {
         .unwrap();
     std::fs::remove_dir_all(root).unwrap();
     println!(
-        "PASS native database UI: automatic objects and clipped catalog, wide/empty table horizontal wheel and scrollbar drag to final column, field comments, Enter filter/reset, filter builder/sort, inline field edit/add/type dropdown/length-scale/NULL/batch DDL and structure dirty-close protection, context close-right/others/all with dirty cancel/confirm, grid insert/update/delete/default/save, 1440/960 layouts and disconnect protection"
+        "PASS native database UI: automatic objects and clipped catalog, wide/empty table horizontal wheel and scrollbar drag to final column, field comments, Enter filter/reset, filter builder/sort, inline field edit/add/type dropdown/length-scale/NULL/direct structure save, failure retry and structure dirty-close protection, context close-right/others/all with dirty cancel/confirm, grid insert/update/delete/default/save, 1440/960 layouts and disconnect protection"
     );
 }
 

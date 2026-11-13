@@ -422,6 +422,8 @@ impl Workbench {
             .map(|g| g.name.clone())
             .collect();
         targets.push(String::new());
+        // 功能：已连接库的右键菜单追加整库 SQL 备份恢复；时间：2026-11-12；作者：lq。
+        let menu = Self::connected_database_menu(menu, view.clone(), &profile, cx);
         menu.submenu("移动到分组", window, cx, move |mut menu, _, _| {
             for target in &targets {
                 let id = profile.id.to_string();

@@ -217,7 +217,7 @@ pub fn run_layout_smoke() {
                     affected: 0,
                 };
                 state.services.grid =
-                    Some(cx.new(|cx| TableState::new(QueryRows(set.clone()), window, cx)));
+                    Some(cx.new(|cx| TableState::new(QueryRows::new(set.clone(), window, cx), window, cx)));
                 state.services.results = Some(QueryResult {
                     sets: vec![
                         set,

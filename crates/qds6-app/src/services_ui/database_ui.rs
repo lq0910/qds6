@@ -1,7 +1,14 @@
 //! 功能：数据库对象、SQL 与结果同屏组织，低频写入和导出按需展开；时间：2026-11-11；作者：lq。
 
 use super::*;
+// 功能：表级菜单与导入导出向导；时间：2026-11-12；作者：lq。
+pub(super) mod actions;
+mod catalog;
+// 功能：SQL 语法关键字与已连接数据库表名补全；时间：2026-11-13；作者：lq。
+// 功能：供工作台共享 SQL 补全类型；时间：2026-11-13；作者：lq。
+pub(crate) mod sql_completion;
 use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
+use gpui_kit::component::scroll::{Scrollbar, ScrollbarMode};
 
 impl Workbench {
     /// 功能：SQL 页面只在查询后分配结果区，空闲时保留完整编辑空间；时间：2026-11-11；作者：lq。
@@ -37,7 +44,7 @@ impl Workbench {
                 this.services.grid = if set.columns.is_empty() {
                     None
                 } else {
-                    Some(cx.new(|cx| TableState::new(QueryRows(set.clone()), window, cx)))
+                    Some(cx.new(|cx| TableState::new(QueryRows::new(set.clone(), window, cx), window, cx)))
                 };
                 this.services.selected_result = *index;
                 cx.notify();
@@ -71,14 +78,63 @@ impl Workbench {
                                     }
                                 )),
                         )
-                    }),
+                    })
+                    .child(div().flex_1())
+                    // 功能：查询结果面板工具栏点击直接弹出系统保存对话框；时间：2026-11-13；作者：lq。
+                    .child(
+                        Button::new("query-result-export-csv")
+                            .small()
+                            .ghost()
+                            .icon(UiIcon::Download)
+                            .tooltip("导出查询结果为 CSV")
+                            .disabled(self.services.results.is_none())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.export_query_csv(window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("query-result-export-xlsx")
+                            .small()
+                            .ghost()
+                            .icon(UiIcon::Table2)
+                            .tooltip("导出查询结果为 Excel")
+                            .disabled(self.services.results.is_none())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.export_query_xlsx(window, cx)
+                            })),
+                    ),
             )
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
                     .when_some(self.services.grid.as_ref(), |v, grid| {
-                        v.child(DataTable::new(grid).small())
+                        // 功能：查询结果横向条独占底部视口，不随长结果内容移出窗口；时间：2026-11-12；作者：lq。
+                        v.child(
+                            v_flex()
+                                .size_full()
+                                .min_w_0()
+                                .min_h_0()
+                                .overflow_hidden()
+                                .child(div().flex_1().min_h_0().min_w_0().overflow_hidden().child(
+                                    DataTable::new(grid).small().scrollbar_visible(true, false),
+                                ))
+                                .child(
+                                    div()
+                                        .id("query-horizontal-scrollbar")
+                                        .test_support()
+                                        .h(px(12.))
+                                        .flex_shrink_0()
+                                        .relative()
+                                        .child(
+                                            Scrollbar::horizontal(
+                                                &grid.read(cx).horizontal_scroll_handle,
+                                            )
+                                            .viewport_from_layout()
+                                            .mode(ScrollbarMode::Always),
+                                        ),
+                                ),
+                        )
                     })
                     .when(self.services.grid.is_none(), |v| {
                         v.p_5()
@@ -195,6 +251,7 @@ impl Workbench {
                     .disabled(self.services.busy || !connected)
                     .on_click(cx.listener(|this, _, window, cx| this.close_database(window, cx))),
             );
+        let database_menu = cx.entity();
         let objects = v_flex()
             .id("database-object-pane")
             .test_support()
@@ -208,7 +265,18 @@ impl Workbench {
                     .px_2()
                     .items_center()
                     .justify_between()
-                    .child(div().text_xs().font_semibold().child("数据库对象"))
+                    .child(
+                        div()
+                            .id("database-root-object")
+                            .test_support()
+                            .flex_1()
+                            .text_xs()
+                            .font_semibold()
+                            .child(format!("数据库 · {}", self.services.database_context.0))
+                            .context_menu(move |menu, window, cx| {
+                                Self::database_context_menu(menu, database_menu.clone(), window, cx)
+                            }),
+                    )
                     .child(
                         Button::new("load-tables")
                             .small()
@@ -228,55 +296,95 @@ impl Workbench {
                     .child(Input::new(&self.services.object_search).small()),
             )
             .child(
-                v_flex()
-                    .id("database-objects")
+                div()
+                    .relative()
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .px_2()
-                    .children(
-                        self.services
-                            .tables
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, table)| self.object_matches(table, cx))
-                            .map(|(index, table)| {
-                                h_flex()
-                                    .id(("database-object", index))
-                                    .test_support()
-                                    .flex_shrink_0()
-                                    .p_2()
-                                    .gap_2()
-                                    .items_center()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .when(self.services.selected_table == Some(index), |v| {
-                                        v.bg(cx.theme().secondary)
-                                    })
-                                    .hover(|v| v.bg(cx.theme().secondary))
-                                    .child(Icon::new(UiIcon::Table2).xsmall())
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .text_xs()
-                                            .text_ellipsis()
-                                            .child(format!("{}.{}", table.schema, table.name)),
-                                    )
-                                    .on_click(cx.listener(
-                                        move |this, event: &ClickEvent, window, cx| {
-                                            this.services.selected_table = Some(index);
-                                            if event.click_count() == 2 {
-                                                this.table_operation(false, window, cx);
-                                            }
-                                            cx.notify();
-                                        },
-                                    ))
-                            }),
+                    .overflow_hidden()
+                    .child(
+                        v_flex()
+                            .id("database-objects")
+                            .size_full()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.services.object_scroll)
+                            .pl_2()
+                            .pr(px(16.))
+                            .children(
+                                self.services
+                                    .tables
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, table)| self.object_matches(table, cx))
+                                    .map(|(index, table)| {
+                                        let menu_view = cx.entity();
+                                        let menu_table = table.clone();
+                                        h_flex()
+                                            .id(("database-object", index))
+                                            .test_support()
+                                            .flex_shrink_0()
+                                            .p_2()
+                                            .gap_2()
+                                            .items_center()
+                                            .rounded_md()
+                                            .cursor_pointer()
+                                            .when(
+                                                self.services.selected_table == Some(index),
+                                                |v| v.bg(cx.theme().secondary),
+                                            )
+                                            .hover(|v| v.bg(cx.theme().secondary))
+                                            .child(Icon::new(UiIcon::Table2).xsmall())
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .text_xs()
+                                                    .text_ellipsis()
+                                                    .child(format!(
+                                                        "{}.{}",
+                                                        table.schema, table.name
+                                                    )),
+                                            )
+                                            .on_click(cx.listener(
+                                                move |this, event: &ClickEvent, window, cx| {
+                                                    this.services.selected_table = Some(index);
+                                                    if event.click_count() == 2 {
+                                                        this.table_operation(false, window, cx);
+                                                    }
+                                                    cx.notify();
+                                                },
+                                            ))
+                                            .context_menu(move |menu, window, cx| {
+                                                Self::table_context_menu(
+                                                    menu,
+                                                    menu_view.clone(),
+                                                    menu_table.clone(),
+                                                    window,
+                                                    cx,
+                                                )
+                                            })
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("database-object-scrollbar")
+                            .test_support()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .right_0()
+                            .w(px(12.))
+                            .child(
+                                Scrollbar::vertical(&self.services.object_scroll)
+                                    .viewport_from_layout()
+                                    .mode(ScrollbarMode::Always),
+                            ),
                     ),
             )
             .child(
                 div()
+                    .flex_shrink_0()
                     .p_2()
                     .text_xs()
                     .child(format!("{} 个对象 · 双击打开", self.services.tables.len())),
@@ -387,7 +495,9 @@ impl Workbench {
             .overflow_hidden()
             .child(div().flex_shrink_0().min_w_0().child(tabs))
             .child(div().flex_1().min_h_0().min_w_0().overflow_hidden().child(
-                if self.services.query_active {
+                if self.services.transfer.is_some() {
+                    self.database_transfer_panel(cx).into_any_element()
+                } else if self.services.query_active {
                     self.database_query_panel(cx).into_any_element()
                 } else if let Some(index) = self.services.active_table_tab {
                     self.table_data_panel(index, cx).into_any_element()
@@ -428,30 +538,37 @@ impl Workbench {
                         ),
                 )
             })
-            .child(div().flex_1().min_h_0().child(if connected {
-                h_resizable("database-object-split")
-                    .child(
-                        resizable_panel()
-                            .size(px(220.))
-                            .size_range(px(150.)..px(500.))
-                            .child(objects),
-                    )
-                    .child(
-                        resizable_panel()
-                            .size(px(900.))
-                            .size_range(px(300.)..Pixels::MAX)
-                            .child(center),
-                    )
-                    .into_any_element()
-            } else {
-                self.service_empty(
-                    Protocol::PostgreSql,
-                    "尚未连接数据库",
-                    "连接后自动显示对象列表，双击表可打开数据。",
-                    cx,
-                )
-                .into_any_element()
-            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .child(if connected {
+                        h_resizable("database-object-split")
+                            .child(
+                                resizable_panel()
+                                    .size(px(220.))
+                                    .size_range(px(150.)..px(500.))
+                                    .child(objects),
+                            )
+                            .child(
+                                resizable_panel()
+                                    .size(px(900.))
+                                    .size_range(px(300.)..Pixels::MAX)
+                                    .child(center),
+                            )
+                            .into_any_element()
+                    } else {
+                        self.service_empty(
+                            Protocol::PostgreSql,
+                            "尚未连接数据库",
+                            "连接后自动显示对象列表，双击表可打开数据。",
+                            cx,
+                        )
+                        .into_any_element()
+                    }),
+            )
     }
 
     /// 功能：对象树和对象列表共享类型及文字筛选；时间：2026-11-11；作者：lq。
@@ -464,35 +581,6 @@ impl Workbench {
         kind && format!("{}.{}", table.schema, table.name)
             .to_lowercase()
             .contains(&self.services.object_search.read(cx).value().to_lowercase())
-    }
-
-    /// 功能：数据库默认页承载可双击对象列表及可收起表详情；时间：2026-11-11；作者：lq。
-    fn database_catalog(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let selected = self
-            .services
-            .selected_table
-            .and_then(|i| self.services.tables.get(i));
-        v_flex().size_full().min_w_0().min_h_0().overflow_hidden()
-            .child(h_flex().flex_shrink_0().p_2().gap_2().items_center().border_b_1().border_color(cx.theme().border)
-                .child(Button::new("browse-table").small().ghost().icon(UiIcon::FolderOpen).label("打开表").disabled(self.services.busy || selected.is_none()).on_click(cx.listener(|this, _, window, cx| this.table_operation(false, window, cx))))
-                .child(Button::new("table-structure").small().ghost().icon(UiIcon::Settings).label("设计表").disabled(selected.is_none()).on_click(cx.listener(|this, _, window, cx| this.table_operation(true, window, cx))))
-                .child(div().flex_1())
-                .child(Button::new("catalog-details").small().ghost().label("表详情").selected(self.services.catalog_details).on_click(cx.listener(|this, _, _, cx| { this.services.catalog_details = !this.services.catalog_details; cx.notify(); }))))
-            .child(h_flex().flex_1().min_w_0().min_h_0().overflow_hidden()
-                .child(v_flex().id("database-catalog").test_support().flex_1().min_w_0().min_h_0().overflow_y_scroll()
-                    .child(h_flex().flex_shrink_0().p_2().gap_3().border_b_1().border_color(cx.theme().border).child(div().flex_1().text_xs().font_semibold().child("名称")).child(div().w(px(150.)).text_xs().child("模式")).child(div().w(px(100.)).text_xs().child("类型")))
-                    .children(self.services.tables.iter().enumerate().filter(|(_, t)| self.object_matches(t, cx)).map(|(index, table)| {
-                        h_flex().id(("catalog-object", index)).test_support().flex_shrink_0().p_2().gap_3().cursor_pointer().border_b_1().border_color(cx.theme().border)
-                            .when(self.services.selected_table == Some(index), |v| v.bg(cx.theme().secondary))
-                            .hover(|v| v.bg(cx.theme().secondary)).child(Icon::new(UiIcon::Table2).xsmall())
-                            .child(div().flex_1().min_w_0().text_xs().text_ellipsis().child(table.name.clone()))
-                            .child(div().w(px(150.)).text_xs().text_ellipsis().child(table.schema.clone()))
-                            .child(div().w(px(100.)).text_xs().child(if table.kind == "BASE TABLE" { "表" } else { "视图" }))
-                            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| { this.services.selected_table = Some(index); if event.click_count() == 2 { this.table_operation(false, window, cx); } cx.notify(); }))
-                    })))
-                .when(self.services.catalog_details, |v| v.child(v_flex().w(px(220.)).p_3().gap_2().border_l_1().border_color(cx.theme().border)
-                    .child(div().text_sm().font_semibold().child(selected.map(|t| t.name.clone()).unwrap_or_else(|| "选择数据库对象".into())))
-                    .child(div().text_xs().child(selected.map(|t| format!("连接：{}\n模式：{}\n类型：{}\n双击打开表后查看字段、主键和默认值", self.services.database_identity, t.schema, t.kind)).unwrap_or_default())))))
     }
 
     /// 功能：常用表设计生成可审阅 SQL，执行入口统一在查询页；时间：2026-11-11；作者：lq。
@@ -599,6 +687,89 @@ impl Workbench {
         );
     }
 
+    /// 功能：导出当前查询结果集为 CSV，弹出系统保存对话框选择位置；时间：2026-11-13；作者：lq。
+    fn export_query_csv(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(set) = self
+            .services
+            .results
+            .as_ref()
+            .and_then(|r| r.sets.get(self.services.selected_result))
+            .cloned()
+        else {
+            self.status = "请先执行查询以获取结果".into();
+            cx.notify();
+            return;
+        };
+        let default_dir = BaseDirs::new()
+            .map(|b| b.home_dir().to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let receiver = cx.prompt_for_new_path(&default_dir, Some("query_result.csv"));
+        cx.spawn_in(window, async move |this, cx| {
+            // 功能：保存对话框直接返回完整路径，避免拆成路径分量；时间：2026-11-13；作者：lq。
+            let Ok(Ok(Some(path))) = receiver.await else {
+                return;
+            };
+            let result = cx
+                .background_spawn(async move {
+                    backup::write_new(&path, &qds6_services::database::csv(&set))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => this.status = "查询结果已导出 CSV".into(),
+                    Err(e) => {
+                        this.status = e.into();
+                        this.error = true;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 功能：导出当前查询结果集为 Excel，弹出系统保存对话框选择位置；时间：2026-11-13；作者：lq。
+    fn export_query_xlsx(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(set) = self
+            .services
+            .results
+            .as_ref()
+            .and_then(|r| r.sets.get(self.services.selected_result))
+            .cloned()
+        else {
+            self.status = "请先执行查询以获取结果".into();
+            cx.notify();
+            return;
+        };
+        let default_dir = BaseDirs::new()
+            .map(|b| b.home_dir().to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let receiver = cx.prompt_for_new_path(&default_dir, Some("query_result.xlsx"));
+        cx.spawn_in(window, async move |this, cx| {
+            // 功能：保留 Excel 保存对话框返回的完整路径；时间：2026-11-13；作者：lq。
+            let Ok(Ok(Some(path))) = receiver.await else {
+                return;
+            };
+            let result = cx
+                .background_spawn(async move {
+                    let bytes = qds6_services::database::xlsx(&set)?;
+                    backup::write_new(&path, &bytes)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => this.status = "查询结果已导出 Excel".into(),
+                    Err(e) => {
+                        this.status = e.into();
+                        this.error = true;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// 功能：关闭真实数据库会话与其表标签，事务和未保存修改明确提示；时间：2026-11-11；作者：lq。
     pub(crate) fn close_database(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.services.busy || self.services.database.is_none() {
@@ -635,12 +806,16 @@ impl Workbench {
                     this.services.query_active = false;
                     let database = this.services.database.take();
                     this.services.database_profile = None;
+                    this.services.transfer = None;
+                    this.services.table_properties.clear();
                     this.services.database_identity.clear();
                     this.services.database_context = (String::new(), String::new());
                     this.services.tables.clear();
                     this.services.selected_table = None;
                     this.services.grid = None;
                     this.services.results = None;
+                    // 功能：断开连接后清空补全提供者的表名缓存，避免显示旧库表名；时间：2026-11-13；作者：lq。
+                    this.sql_tables.clear();
                     if this.services.page == 3 && this.tab == 3 {
                         this.tab = 0;
                     }
@@ -735,16 +910,28 @@ impl Workbench {
                     .child(div().flex_1())
                     .children(
                         [
-                            ("query-begin", "BEGIN"),
-                            ("query-commit", "COMMIT"),
-                            ("query-rollback", "ROLLBACK"),
+                            // 功能：用中文和悬停提示解释手动事务操作；时间：2026-11-13；作者：lq。
+                            (
+                                "query-begin",
+                                "BEGIN",
+                                "开始事务",
+                                "开始手动事务，后续修改需提交或回滚",
+                            ),
+                            ("query-commit", "COMMIT", "提交事务", "提交当前事务中的修改"),
+                            (
+                                "query-rollback",
+                                "ROLLBACK",
+                                "回滚事务",
+                                "撤销当前事务中尚未提交的修改",
+                            ),
                         ]
                         .into_iter()
-                        .map(|(id, sql)| {
+                        .map(|(id, sql, label, hint)| {
                             Button::new(id)
                                 .small()
                                 .ghost()
-                                .label(sql)
+                                .label(label)
+                                .tooltip(hint)
                                 .disabled(self.services.busy)
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.execute_sql(Some(sql.into()), window, cx)
@@ -756,11 +943,10 @@ impl Workbench {
                             .small()
                             .ghost()
                             .icon(UiIcon::Download)
-                            .tooltip("导出查询结果")
+                            .tooltip("导出查询结果为 CSV")
                             .disabled(self.services.results.is_none())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.services.show_csv_export = !this.services.show_csv_export;
-                                cx.notify();
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.export_query_csv(window, cx);
                             })),
                     ),
             )

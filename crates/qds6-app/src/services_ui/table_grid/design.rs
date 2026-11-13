@@ -1,4 +1,4 @@
-//! 功能：Navicat 式字段列表行内编辑、类型选择与批量 SQL 预览；时间：2026-11-12；作者：lq。
+//! 功能：Navicat 式字段列表行内编辑、类型选择与直接保存表结构；时间：2026-11-12；作者：lq。
 use super::*;
 use qds6_services::database::GridColumn;
 mod sql;
@@ -74,6 +74,8 @@ impl DesignRow {
 pub(super) struct TableDesign {
     rows: Vec<DesignRow>,
     indexes: bool,
+    // 功能：保存后刷新失败时阻止重复提交，允许重新读取；时间：2026-11-13；作者：lq。
+    reload_required: bool,
     horizontal: ScrollHandle,
     vertical: ScrollHandle,
 }
@@ -86,6 +88,7 @@ impl TableDesign {
                 .map(|c| DesignRow::new(Some(c), window, cx))
                 .collect(),
             indexes: false,
+            reload_required: false,
             horizontal: ScrollHandle::new(),
             vertical: ScrollHandle::new(),
         }
@@ -144,8 +147,10 @@ impl Workbench {
         let tab = &self.services.table_tabs[index];
         let data = tab.grid.read(cx).delegate();
         let d = &tab.design;
-        let readonly =
-            self.services.busy || tab.table.kind != "BASE TABLE" || !data.changes().is_empty();
+        let readonly = self.services.busy
+            || d.reload_required
+            || tab.table.kind != "BASE TABLE"
+            || !data.changes().is_empty();
         let count = d.rows.iter().filter(|r| r.change(cx).dirty()).count();
         let protocol = self
             .services
@@ -202,7 +207,7 @@ impl Workbench {
                     .ghost()
                     .icon(UiIcon::RefreshCw)
                     .tooltip("重新读取结构与数据；有草稿时请先撤销修改")
-                    .disabled(readonly || count > 0)
+                    .disabled(self.services.busy || count > 0)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.refresh_table_tab(BrowseRequest::default(), window, cx);
                     })),
@@ -229,14 +234,14 @@ impl Workbench {
                     })),
             )
             .child(
-                Button::new("design-preview")
+                Button::new("design-save")
                     .small()
                     .primary()
-                    .label("预览变更 SQL")
+                    .label("保存")
                     .disabled(readonly || count == 0)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.preview_design(index, window, cx)
-                    })),
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.save_design(index, window, cx)),
+                    ),
             )
             .child(
                 Button::new("design-discard")
@@ -264,7 +269,7 @@ impl Workbench {
                     .child(if count == 0 {
                         "直接点击单元格编辑 · 类型可下拉选择".to_string()
                     } else {
-                        format!("{count} 个字段待变更 · 预览后在查询页运行")
+                        format!("{count} 个字段待变更 · 点击保存直接应用")
                     }),
             );
         let widths = [30., 160., 220., 68., 64., 56., 48., 180., 240., 64.];
@@ -453,7 +458,7 @@ impl Workbench {
             .child(div().id("design-horizontal-scrollbar").test_support().h(px(12.)).flex_shrink_0().relative()
                 .child(Scrollbar::horizontal(&d.horizontal).viewport_from_layout().mode(ScrollbarMode::Always)))
             .child(div().px_3().py_2().flex_shrink_0().text_xs().text_color(cx.theme().muted_foreground)
-                .child(if readonly { "请先保存或取消数据修改；视图仅支持查看结构" } else {
+                .child(if d.reload_required { "结构已保存，读取失败；请点击刷新重新读取后继续编辑" } else if readonly { "请先保存或取消数据修改；视图仅支持查看结构" } else {
                     "变更保留在当前表草稿中 · 删除可恢复 · 主键显示现有定义 · 生成列通过 SQL 编辑"
                 }));
         let indexes = v_flex()
@@ -482,10 +487,11 @@ impl Workbench {
             })
             .into_any_element()
     }
-    /// 功能：统一预览全部字段草稿，不直接对连接执行结构写入；时间：2026-11-12；作者：lq。
-    fn preview_design(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+    /// 功能：后台直接保存字段草稿，成功刷新并留在设计页，失败保留草稿；时间：2026-11-13；作者：lq。
+    fn save_design(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let tab = &self.services.table_tabs[index];
         if self.services.busy
+            || tab.design.reload_required
             || tab.table.kind != "BASE TABLE"
             || !tab.grid.read(cx).delegate().changes().is_empty()
         {
@@ -495,8 +501,49 @@ impl Workbench {
             return;
         };
         let changes: Vec<_> = tab.design.rows.iter().map(|r| r.change(cx)).collect();
-        match sql::generate_sql(profile.protocol, &tab.table, &changes) {
-            Ok(sql) => self.show_generated_sql(sql, window, cx),
+        let Some(database) = self.services.database.clone() else {
+            return;
+        };
+        let table = tab.table.clone();
+        let columns = tab.grid.read(cx).delegate().page.columns.clone();
+        match sql::save_sql(profile.protocol, &table, &changes) {
+            Ok(sql) => {
+                self.service_job(
+                    "正在保存表设计…",
+                    move || {
+                        database.save_structure(&table, &columns, &sql)?;
+                        // 功能：分开返回执行和读取结果，防止读取失败后再次执行已成功的 DDL；时间：2026-11-13；作者：lq。
+                        Ok(database.browse_page(&table, &BrowseRequest::default()))
+                    },
+                    move |this, page, window, cx| {
+                        let tab = &mut this.services.table_tabs[index];
+                        match page {
+                            Ok(page) => {
+                                tab.design = TableDesign::new(&page.columns, window, cx);
+                                tab.request = BrowseRequest::default();
+                                tab.filters = vec![filters::FilterDraft::new(window, cx)];
+                                tab.order.clear();
+                                tab.grid.update(cx, |state, cx| {
+                                    *state.delegate_mut() = TableRows::new(page);
+                                    state.clear_selection(cx);
+                                    state.refresh(cx);
+                                });
+                                this.status = "表设计已保存".into();
+                            }
+                            Err(error) => {
+                                let columns = tab.grid.read(cx).delegate().page.columns.clone();
+                                tab.design = TableDesign::new(&columns, window, cx);
+                                tab.design.reload_required = true;
+                                this.status =
+                                    format!("表设计已保存，但刷新失败：{error}；请点击刷新").into();
+                                this.error = true;
+                            }
+                        }
+                    },
+                    window,
+                    cx,
+                );
+            }
             Err(error) => {
                 self.status = error.into();
                 self.error = true;

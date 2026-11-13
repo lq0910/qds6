@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """功能：生成无需 Homebrew 的原生 Mac 内部测试包并校验签名；时间：2026-11-11；作者：lq。"""
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -30,8 +31,9 @@ def run():
     parser = argparse.ArgumentParser()
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--output", type=Path)
-    # 功能：构建号保存在包内，内部更新始终复用固定目录与应用名；时间：2026-11-11；作者：lq。
-    parser.add_argument("--build-number", default="2026111107")
+    # 功能：日常内测固定构建号，沿用 Cargo 版本与同名输出，正式调整时可显式指定；时间：2026-11-12；作者：lq。
+    parser.add_argument("--build-number", default="2026111203",
+                        help="内部测试固定构建号（默认：2026111203），日常重打包无需递增")
     options = parser.parse_args()
     if not options.build_number.isascii() or not options.build_number.isdigit():
         raise SystemExit("构建号须为 ASCII 数字")
@@ -88,11 +90,14 @@ def run():
             "NSHumanReadableCopyright": "Copyright © 2026 lq. Third-party notices included.",
         }, target, sort_keys=True)
     files = command(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"]).split("\0")
-    source_hashes = {p: sha256(ROOT / p) for p in sorted(set(files)) if p and (ROOT / p).is_file() and (p.startswith(("crates/", "assets/", ".cargo/")) or p in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml"))}
+    # 功能：指纹包含打包脚本，固定版本号下仍可追溯源码和打包流程；时间：2026-11-12；作者：lq。
+    source_hashes = {p: sha256(ROOT / p) for p in sorted(set(files)) if p and (ROOT / p).is_file() and (p.startswith(("crates/", "assets/", ".cargo/", "scripts/")) or p in ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml"))}
     manifest = {
         "description": "功能：未提交工作树与发行构建内容指纹；时间：2026-11-11；作者：lq。",
         "version": version, "channel": "internal", "platform": "aarch64-apple-darwin",
         "build_number": options.build_number,
+        # 功能：固定版本与构建号时，用 UTC 打包时间和内容指纹区分实际产物；时间：2026-11-12；作者：lq。
+        "packaged_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "baseline_commit": command(["git", "rev-parse", "HEAD"]).strip(),
         "working_tree_has_changes": bool(command(["git", "status", "--porcelain"]).strip()),
         "cargo_lock_sha256": sha256(ROOT / "Cargo.lock"),

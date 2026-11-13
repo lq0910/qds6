@@ -14,6 +14,7 @@ use gpui_kit::{
     },
     *,
 };
+use services_ui::database_ui::sql_completion::{SqlCompletionProvider, TableNames};
 use qds6_core::{ConnectionProfile, Protocol, TextLimits};
 use qds6_storage::ProfileStore;
 use std::path::PathBuf;
@@ -168,6 +169,8 @@ struct Workbench {
     form: ProfileForm,
     search: Entity<InputState>,
     sql: Entity<EditorState>,
+    // 功能：SQL 编辑器补全提供者共享表名列表，连接后原地更新，断连后清空；时间：2026-11-13；作者：lq。
+    sql_tables: TableNames,
     tab: usize,
     // 功能：服务器和数据库有独立工作区入口；时间：2026-11-11；作者：lq。
     area: workspace_ui::WorkspaceArea,
@@ -210,13 +213,19 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索连接、分组或主机"));
+        // 功能：补全提供者和表名列表在 sql 创建前初始化，避免循环引用；时间：2026-11-13；作者：lq。
+        let sql_tables = TableNames::default();
         let sql = cx.new(|cx| {
-            EditorState::new(window, cx)
+            let mut state = EditorState::new(window, cx)
                 .language("sql")
                 .line_number(true)
                 .searchable(true)
                 .soft_wrap(false)
-                .default_value(INITIAL_SQL)
+                .default_value(INITIAL_SQL);
+            // 功能：注册 SQL 补全提供者，启用关键字和表名联想；时间：2026-11-13；作者：lq。
+            state.lsp_mut().completion_provider =
+                Some(std::rc::Rc::new(SqlCompletionProvider::new(sql_tables.clone())));
+            state
         });
         let subscriptions = vec![
             cx.subscribe(&search, |_, _, _: &InputEvent, cx| cx.notify()),
@@ -233,6 +242,7 @@ impl Workbench {
             form: ProfileForm::new(ConnectionProfile::new(Protocol::Ssh), window, cx),
             search,
             sql,
+            sql_tables,
             tab: 0,
             area: workspace_ui::WorkspaceArea::Servers,
             sidebar_visible: true,

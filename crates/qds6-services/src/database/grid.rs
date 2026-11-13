@@ -17,7 +17,7 @@ pub struct GridColumn {
     pub generated: bool,
     pub primary: bool,
     pub writable: bool,
-    cast: String,
+    pub(super) cast: String,
 }
 
 /// 功能：每张表独立持有已提交的分页与筛选条件；时间：2026-11-11；作者：lq。
@@ -202,8 +202,15 @@ impl DatabaseSession {
                 } else {
                     Some(text(7))
                 },
+                // 功能：转储区分身份列与计算列，身份值恢复后保留；时间：2026-11-12；作者：lq。
                 extra: if pg {
-                    String::new()
+                    if text(5) == "YES" {
+                        "IDENTITY".into()
+                    } else if text(4) == "ALWAYS" {
+                        "GENERATED".into()
+                    } else {
+                        String::new()
+                    }
                 } else {
                     text(4).replace("DEFAULT_GENERATED", "").trim().to_string()
                 },

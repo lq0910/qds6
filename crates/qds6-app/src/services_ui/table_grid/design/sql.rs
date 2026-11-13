@@ -194,10 +194,30 @@ pub(super) fn type_presets(protocol: Protocol) -> &'static [&'static str] {
 }
 
 /// 功能：为多个编辑行生成统一 DDL，原字段按变化属性更新并保留 MySQL 完整定义；时间：2026-11-12；作者：lq。
+#[cfg(test)]
 pub(super) fn generate_sql(
     protocol: Protocol,
     table: &Table,
     changes: &[ColumnChange],
+) -> Result<String, String> {
+    generate_plan(protocol, table, changes, true)
+}
+
+/// 功能：直接保存使用无事务关键字的计划，由服务统一管理事务和失败回滚；时间：2026-11-13；作者：lq。
+pub(super) fn save_sql(
+    protocol: Protocol,
+    table: &Table,
+    changes: &[ColumnChange],
+) -> Result<String, String> {
+    generate_plan(protocol, table, changes, false)
+}
+
+/// 功能：共用字段校验及 DDL 生成，按调用方式决定是否输出事务包装；时间：2026-11-13；作者：lq。
+fn generate_plan(
+    protocol: Protocol,
+    table: &Table,
+    changes: &[ColumnChange],
+    wrap: bool,
 ) -> Result<String, String> {
     let quote = |name: &str| qds6_services::database::identifier(protocol, name);
     let target = format!("{}.{}", quote(&table.schema)?, quote(&table.name)?);
@@ -234,7 +254,7 @@ pub(super) fn generate_sql(
                 .filter_map(|other| other.original.as_ref())
                 .any(|old| old.values.name == c.values.name)
         {
-            return Err("新字段名仍被原字段占用，请分次预览并执行重命名".into());
+            return Err("新字段名仍被原字段占用，请分次保存重命名".into());
         }
     }
     let mut sql = Vec::new();
@@ -340,7 +360,7 @@ pub(super) fn generate_sql(
     if sql.is_empty() {
         return Err("没有待生成的字段变更".into());
     }
-    if protocol == Protocol::PostgreSql && sql.len() > 1 {
+    if wrap && protocol == Protocol::PostgreSql && sql.len() > 1 {
         sql.insert(0, "BEGIN;".into());
         sql.push("COMMIT;".into());
     }
@@ -353,7 +373,9 @@ pub(super) fn generate_sql(
 // 功能：验证批量 DDL 的方言差异、参数重组与草稿保护；时间：2026-11-12；作者：lq。
 #[cfg(test)]
 mod tests {
-    use super::{ColumnChange, Definition, FieldValues, Protocol, Table, generate_sql, split_type};
+    use super::{
+        ColumnChange, Definition, FieldValues, Protocol, Table, generate_sql, save_sql, split_type,
+    };
     use qds6_core::{ConnectionProfile, TlsMode};
     use qds6_services::database::DatabaseSession;
     /// 功能：构造受控字段定义，不访问用户数据库；时间：2026-11-12；作者：lq。
@@ -513,6 +535,8 @@ mod tests {
                 "CREATE TABLE {target}(id INT PRIMARY KEY, label VARCHAR(40), obsolete TEXT)"
             ))
             .unwrap();
+            // 功能：先建立旧表结果缓存，验证 DDL 后重新读取不会触发 cached plan 错误；时间：2026-11-13；作者：lq。
+            db.browse_page(&table, &Default::default()).unwrap();
             let columns = db.grid_columns(&table).unwrap();
             let mut changes: Vec<_> = columns
                 .iter()
@@ -545,8 +569,21 @@ mod tests {
                 },
                 deleted: false,
             });
-            let sql = generate_sql(protocol, &table, &changes).unwrap();
-            db.query(&sql).unwrap();
+            // 功能：真实服务验证保存事务隔离、失败回滚以及成功后不会残留手动事务；时间：2026-11-13；作者：lq。
+            let sql = save_sql(protocol, &table, &changes).unwrap();
+            db.query("BEGIN").unwrap();
+            assert!(db.save_structure(&table, &columns, &sql).is_err());
+            db.query("ROLLBACK").unwrap();
+            if protocol == Protocol::PostgreSql {
+                let invalid = format!(
+                    "ALTER TABLE {target} ADD COLUMN rolled_back INT; SELECT qds6_missing_function();"
+                );
+                assert!(db.save_structure(&table, &columns, &invalid).is_err());
+                assert_eq!(db.grid_columns(&table).unwrap().len(), columns.len());
+            }
+            db.save_structure(&table, &columns, &sql).unwrap();
+            assert!(db.save_structure(&table, &columns, &sql).is_err());
+            db.browse_page(&table, &Default::default()).unwrap();
             let fresh = db.grid_columns(&table).unwrap();
             assert_eq!(fresh.len(), 3);
             assert_eq!(fresh[1].name, "title");

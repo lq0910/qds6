@@ -362,9 +362,7 @@ impl Workbench {
                                 .iter()
                                 .any(|tab| &tab.grid == grid && tab.design.dirty(cx))
                             {
-                                this.status =
-                                    "请先执行结构变更并撤销草稿后刷新，或撤销结构修改，再编辑数据"
-                                        .into();
+                                this.status = "请先保存或撤销结构修改，再编辑数据".into();
                                 cx.notify();
                                 return;
                             }

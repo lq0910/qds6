@@ -21,6 +21,10 @@ zeroize = "1"
 directories.workspace = true
 # 功能：以系统本地时区显示文件修改时间；时间：2026-11-11；作者：lq。
 chrono = "0.4"
+# 功能：SQL 补全沿用 Kit 的协议与文本类型；时间：2026-11-13；作者：lq。
+anyhow = "1"
+lsp-types = "0.97"
+ropey = "=2.0.0-beta.1"
 
 # 功能：仅显式验收时启用 GPUI 测试支持，不进入常规构建；时间：2026-11-10；作者：lq。
 [features]
