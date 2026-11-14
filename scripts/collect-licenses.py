@@ -5,6 +5,7 @@ import concurrent.futures
 import hashlib
 import json
 from pathlib import Path
+import platform
 import re
 import shutil
 import subprocess
@@ -20,8 +21,11 @@ def run():
     """功能：仅普通/构建依赖闭包；缺失原文只从上游精确提交下载，不执行来源；时间：2026-11-11；作者：lq。"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--fetch-missing", action="store_true")
+    # 功能：按实际发布架构收集普通及构建依赖许可；时间：2026-11-13；作者：lq。
+    parser.add_argument("--target", choices=["aarch64-apple-darwin", "x86_64-apple-darwin"],
+                        default="x86_64-apple-darwin" if platform.machine() == "x86_64" else "aarch64-apple-darwin")
     args = parser.parse_args()
-    metadata = json.loads(subprocess.check_output(["cargo", "metadata", "--locked", "--format-version", "1", "--filter-platform", "aarch64-apple-darwin"], cwd=ROOT))
+    metadata = json.loads(subprocess.check_output(["cargo", "metadata", "--locked", "--format-version", "1", "--filter-platform", args.target], cwd=ROOT))
     packages = {p["id"]: p for p in metadata["packages"]}
     nodes = {n["id"]: n for n in metadata["resolve"]["nodes"]}
     seen = set()

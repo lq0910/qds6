@@ -40,16 +40,12 @@ impl QueryRows {
 
     /// 功能：提交编辑内容到本地数据，不发起数据库 UPDATE；时间：2026-11-13；作者：lq。
     fn commit_edit(&mut self, cx: &App) {
-        if let Some((row, col)) = self.editing.take() {
-            if let Some(cell) = self
-                .data
-                .rows
-                .get_mut(row)
-                .and_then(|r| r.get_mut(col))
-            {
-                let text = self.editor.read(cx).value().to_string();
-                *cell = qds6_services::database::Cell::Text(text);
-            }
+        // 功能：仅提交存在的编辑单元格，通过 CI 严格 lint；时间：2026-11-13；作者：lq。
+        if let Some((row, col)) = self.editing.take()
+            && let Some(cell) = self.data.rows.get_mut(row).and_then(|r| r.get_mut(col))
+        {
+            let text = self.editor.read(cx).value().to_string();
+            *cell = qds6_services::database::Cell::Text(text);
         }
     }
 }
@@ -118,9 +114,7 @@ impl TableDelegate for QueryRows {
             let editor = self.editor.clone();
             div()
                 .size_full()
-                .child(
-                    Input::new(&editor).xsmall(),
-                )
+                .child(Input::new(&editor).xsmall())
                 .into_any_element()
         } else {
             let display = self.data.rows[row][col].display();
@@ -198,9 +192,6 @@ pub(super) struct ServiceUi {
     // 功能：CSV 导出路径独立于 SFTP，本地路径不再跨任务复用；时间：2026-11-11；作者：lq。
     show_csv_export: bool,
     csv_path: Entity<InputState>,
-    // 功能：Excel 导出路径与 CSV 独立，格式不同不复用；时间：2026-11-13；作者：lq。
-    pub(super) show_xlsx_export: bool,
-    pub(super) xlsx_path: Entity<InputState>,
     backup_path: Entity<InputState>,
     backup_password: Entity<InputState>,
     preview: Option<Configuration>,
@@ -279,8 +270,6 @@ impl ServiceUi {
             show_database_tools: false,
             show_csv_export: false,
             csv_path: cx.new(|cx| InputState::new(window, cx).placeholder("CSV 保存文件绝对路径")),
-            show_xlsx_export: false,
-            xlsx_path: cx.new(|cx| InputState::new(window, cx).placeholder("Excel 保存文件绝对路径（.xlsx）")),
             backup_path,
             backup_password,
             preview: None,
@@ -843,11 +832,16 @@ impl Workbench {
                     }
                 )
                 .into();
-                this.services.grid = result
-                    .sets
-                    .first()
-                    .filter(|s| !s.columns.is_empty())
-                    .map(|set| cx.new(|cx| TableState::new(QueryRows::new(set.clone(), window, cx), window, cx)));
+                this.services.grid =
+                    result
+                        .sets
+                        .first()
+                        .filter(|s| !s.columns.is_empty())
+                        .map(|set| {
+                            cx.new(|cx| {
+                                TableState::new(QueryRows::new(set.clone(), window, cx), window, cx)
+                            })
+                        });
                 this.services.results = Some(result);
                 this.services.selected_result = 0;
                 // 功能：查询结果留在当前 SQL 编辑区，后台完成不抢走其他标签；时间：2026-11-11；作者：lq。

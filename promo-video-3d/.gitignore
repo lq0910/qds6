@@ -1,0 +1,4 @@
+# 功能：排除视频工程依赖与缓存；时间：2026-11-14；作者：lq。
+node_modules/
+.remotion/
+build/

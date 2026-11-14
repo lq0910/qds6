@@ -1,0 +1,184 @@
+# 功能：手动运行双架构 Mac 构建，全部成功后自动创建 tag 并发布内测安装包；时间：2026-11-13；作者：lq。
+name: QDS6 macOS release
+run-name: macOS release · ${{ github.ref_name }} · build ${{ github.run_number }}
+
+on:
+  workflow_dispatch:
+    # 功能：默认无需 Apple 账号的 ad-hoc 内测，保留正式签名选项；时间：2026-11-13；作者：lq。
+    inputs:
+      signing_mode:
+        description: '签名方式：adhoc 无需证书；developer-id 需要 Apple Secrets'
+        type: choice
+        default: adhoc
+        options:
+          - adhoc
+          - developer-id
+
+permissions:
+  contents: read
+
+# 功能：同一源码分支的发布顺序执行，避免并发创建或覆盖相同 tag；时间：2026-11-13；作者：lq。
+concurrency:
+  group: qds6-macos-release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check required signing configuration
+        if: inputs.signing_mode == 'developer-id'
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: python3 scripts/ci-macos-signing.py check
+      - name: Read Cargo version and generate unique release tag
+        id: version
+        env:
+          RELEASE_BRANCH: ${{ github.ref }}
+        run: |
+          # 功能：仅主分支发布，版本来自源码，重跑同一运行复用相同 tag；时间：2026-11-13；作者：lq。
+          test "$RELEASE_BRANCH" = refs/heads/main
+          python3 - <<'PY'
+          # 功能：生成无需人工维护的内测版本标签；时间：2026-11-13；作者：lq。
+          import os
+          import tomllib
+          from pathlib import Path
+          version = tomllib.loads(Path('Cargo.toml').read_text())['workspace']['package']['version']
+          tag = f"v{version}-internal.{os.environ['GITHUB_RUN_NUMBER']}"
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'version={version}\ntag={tag}\n')
+          PY
+
+  checks:
+    needs: metadata
+    uses: ./.github/workflows/ci.yml
+
+  package:
+    needs: [metadata, checks]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            arch: x86_64
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      # 功能：两架构统一最低系统版本，原生 release 编译不启用测试功能；时间：2026-11-13；作者：lq。
+      MACOSX_DEPLOYMENT_TARGET: '14.0'
+      SIGNING_MODE: ${{ inputs.signing_mode }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Import Developer ID and notarization credentials
+        if: inputs.signing_mode == 'developer-id'
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: python3 scripts/ci-macos-signing.py setup
+      - name: Collect architecture-specific third-party licenses
+        env:
+          PACKAGE_TARGET: ${{ matrix.target }}
+        run: python3 scripts/collect-licenses.py --fetch-missing --target "$PACKAGE_TARGET"
+      - name: Build and verify APP, DMG and ZIP
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          # 功能：ad-hoc 不读取 Apple 凭据，正式模式必须完整签名和公证；时间：2026-11-13；作者：lq。
+          signing_args=()
+          if [ "$SIGNING_MODE" = developer-id ]; then
+            signing_args=(--signing-identity "$MACOS_SIGNING_IDENTITY" --notary-profile qds6-notary
+              --signing-keychain "$RUNNER_TEMP/qds6-signing/release.keychain-db")
+          fi
+          python3 scripts/package-macos.py --build-number "$GITHUB_RUN_ID" --output output/ci-package "${signing_args[@]}"
+      - name: Remove temporary signing credentials
+        if: always() && inputs.signing_mode == 'developer-id'
+        run: python3 scripts/ci-macos-signing.py cleanup
+      - name: Check archive hashes
+        working-directory: output/ci-package
+        run: shasum -a 256 -c SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            output/ci-package/*.dmg
+            output/ci-package/*.zip
+            output/ci-package/SHA256SUMS
+            output/ci-package/build-manifest.json
+            output/ci-package/dynamic-libraries.txt
+            output/ci-package/*-notarization.json
+
+  publish:
+    needs: [metadata, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+      PACKAGE_VERSION: ${{ needs.metadata.outputs.version }}
+      SIGNING_MODE: ${{ inputs.signing_mode }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: macos-*
+          path: artifacts
+      - name: Verify both architectures and assemble release assets
+        run: |
+          python3 scripts/prepare-macos-release.py --directory artifacts --output release-assets \
+            --version "$PACKAGE_VERSION" --commit "$GITHUB_SHA" --build-number "$GITHUB_RUN_ID" \
+            --signing-mode "$SIGNING_MODE"
+      - name: Create tag and publish complete release
+        run: |
+          # 功能：拒绝错指提交及已公开的 tag，上传完成才公开；失败可重跑草稿；时间：2026-11-13；作者：lq。
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$GITHUB_SHA"
+          fi
+          if gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft > /tmp/qds6-release-draft; then
+            test "$(cat /tmp/qds6-release-draft)" = true
+            test "$(gh release view "$RELEASE_TAG" --json targetCommitish --jq .targetCommitish)" = "$GITHUB_SHA"
+          else
+            gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" \
+              --title "QDS6 $RELEASE_TAG · macOS 内测" \
+              --draft --prerelease --notes-file release-assets/RELEASE-NOTES.md
+          fi
+          gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false
+          gh release view "$RELEASE_TAG" --json url --jq .url >> "$GITHUB_STEP_SUMMARY"

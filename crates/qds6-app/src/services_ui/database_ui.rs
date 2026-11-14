@@ -44,7 +44,9 @@ impl Workbench {
                 this.services.grid = if set.columns.is_empty() {
                     None
                 } else {
-                    Some(cx.new(|cx| TableState::new(QueryRows::new(set.clone(), window, cx), window, cx)))
+                    Some(cx.new(|cx| {
+                        TableState::new(QueryRows::new(set.clone(), window, cx), window, cx)
+                    }))
                 };
                 this.services.selected_result = *index;
                 cx.notify();
@@ -88,9 +90,11 @@ impl Workbench {
                             .icon(UiIcon::Download)
                             .tooltip("导出查询结果为 CSV")
                             .disabled(self.services.results.is_none())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.export_query_csv(window, cx)
-                            })),
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.export_query_csv(window, cx)
+                                }),
+                            ),
                     )
                     .child(
                         Button::new("query-result-export-xlsx")

@@ -6,3 +6,31 @@
 *.sqlite3-wal
 /output/
 __pycache__/
+
+# 功能：排除宣传视频依赖、渲染产物和工具缓存；时间：2026-11-14；作者：lq。
+node_modules/
+/promo-video/out/
+# 功能：排除 Playwright CLI 本地浏览器快照；时间：2026-11-14；作者：lq。
+/.playwright-cli/
+.cache/
+*.tsbuildinfo
+*.py[cod]
+
+# 功能：排除本地环境配置、签名凭据和运行日志，保留配置示例；时间：2026-11-14；作者：lq。
+.env
+.env.*
+!.env.example
+!.env.*.example
+!.env.sample
+*.p12
+*.pfx
+*.keychain
+*.keychain-db
+*.log
+
+# 功能：排除系统缩略图和编辑器临时文件；时间：2026-11-14；作者：lq。
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~

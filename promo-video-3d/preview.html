@@ -1,0 +1,47 @@
+<!doctype html>
+<!-- 功能：提供成片的离线播放器与章节跳转；时间：2026-11-14；作者：lq。 -->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>QDS6 — 连接，从此简单。</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ctext y='19' fill='%23f4f4f1' font-family='sans-serif' font-size='22'%3EQ%3C/text%3E%3C/svg%3E">
+  <style>
+    /* 功能：让播放器适配电脑与手机并保持可见焦点；时间：2026-11-14；作者：lq。 */
+    :root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;background:#17232b;color:#e9f1f2}
+    *{box-sizing:border-box}body{margin:0;padding:38px 5vw 48px}main{max-width:1480px;margin:auto}
+    header{display:flex;align-items:center;justify-content:space-between;margin-bottom:25px}.brand{font-size:25px;letter-spacing:-1px;font-weight:650}
+    .muted{font-size:12px;color:#a9c0c5;letter-spacing:2px}video{display:block;width:100%;aspect-ratio:16/9;background:#101820;border-radius:12px;border:1px solid #526a72}
+    .footer{display:flex;justify-content:space-between;align-items:center;margin-top:24px;gap:24px;flex-wrap:wrap}h1{font-size:23px;font-weight:500;margin:0 0 9px}p{font-size:13px;color:#a8b7b9;margin:0}
+    nav{display:flex;gap:8px;flex-wrap:wrap}button,a{font:inherit;font-size:12px;color:#ccc;border:1px solid #444;border-radius:6px;background:transparent;padding:10px 15px;cursor:pointer;text-decoration:none}
+    button:hover,a:hover{color:#fff;border-color:#888}button:focus-visible,a:focus-visible{outline:2px solid #f4f4f1;outline-offset:4px}
+    .meta{margin-top:24px;font-size:11px;color:#888;line-height:1.8}
+    @media(max-width:600px){body{padding:25px 18px}.muted{font-size:10px;letter-spacing:1px}.footer{align-items:flex-start}nav{gap:6px}button,a{padding:10px 12px}h1{font-size:20px}}
+  </style>
+</head>
+<body>
+  <main>
+    <header><span class="brand">QDS6</span><span class="muted">PRODUCT FILM / 2026</span></header>
+    <video id="film" controls playsinline preload="metadata" poster="frame-1605.png" aria-label="QDS6 55 秒 3D 一镜到底产品发布片">
+      <source src="QDS6-Launch-3D-1080p.mp4" type="video/mp4">
+      您的浏览器不支持视频播放，请下载 MP4。
+    </video>
+    <div class="footer">
+      <div><h1>连接，从此简单。</h1><p>终端、文件与数据库，一个工作台。</p></div>
+      <nav aria-label="视频章节">
+        <button data-time="0">开场</button><button data-time="5.5">终端</button><button data-time="15.3">文件</button><button data-time="24.2">数据库</button><button data-time="33.5">工作台</button><button data-time="50.3">落版</button>
+        <a href="QDS6-Launch-3D-1080p.mp4" download>下载 MP4 ↓</a>
+      </nav>
+    </div>
+    <div class="meta">55.6 秒 · 1920 × 1080 · 30 fps · 用户提供原声配乐<br>Rust 原生构建 · GPUI 渲染 · SSH / SFTP / MySQL / PostgreSQL<br>片中演绎界面使用示例数据。</div>
+  </main>
+  <script>
+    // 功能：点击章节后从对应镜头播放，保留浏览器原生播放控制；时间：2026-11-14；作者：lq。
+    const film = document.querySelector('#film');
+    document.querySelectorAll('[data-time]').forEach(button => button.addEventListener('click', () => {
+      film.currentTime = Number(button.dataset.time);
+      film.play().catch(() => {});
+    }));
+  </script>
+</body>
+</html>

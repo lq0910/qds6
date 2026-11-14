@@ -14,9 +14,9 @@ use gpui_kit::{
     },
     *,
 };
-use services_ui::database_ui::sql_completion::{SqlCompletionProvider, TableNames};
 use qds6_core::{ConnectionProfile, Protocol, TextLimits};
 use qds6_storage::ProfileStore;
+use services_ui::database_ui::sql_completion::{SqlCompletionProvider, TableNames};
 use std::path::PathBuf;
 
 // 功能：接入统一品牌与 Lucide 图标资源；时间：2026-11-10；作者：lq。
@@ -223,8 +223,9 @@ impl Workbench {
                 .soft_wrap(false)
                 .default_value(INITIAL_SQL);
             // 功能：注册 SQL 补全提供者，启用关键字和表名联想；时间：2026-11-13；作者：lq。
-            state.lsp_mut().completion_provider =
-                Some(std::rc::Rc::new(SqlCompletionProvider::new(sql_tables.clone())));
+            state.lsp_mut().completion_provider = Some(std::rc::Rc::new(
+                SqlCompletionProvider::new(sql_tables.clone()),
+            ));
             state
         });
         let subscriptions = vec![

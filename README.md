@@ -1,8 +1,8 @@
 # QDS6
 
-<a href="assets/promo/QDS6-Launch-3D-1080p.mp4"><img src="assets/promo/QDS6-Launch-3D-cover.png" alt="播放 QDS6 产品发布片：55.6 秒，1080p" width="720"></a>
+**[播放最终 3D 产品发布片](https://github.com/lq0910/qds6/blob/main/assets/promo/QDS6-Launch-3D-1080p.mp4)** · 55.6 秒 · 1920 × 1080 · [下载 MP4](https://raw.githubusercontent.com/lq0910/qds6/main/assets/promo/QDS6-Launch-3D-1080p.mp4)
 
-**QDS6 产品发布片 / 55.6 秒 / 1920 × 1080**：[播放或下载 MP4](assets/promo/QDS6-Launch-3D-1080p.mp4)
+仓库下载后，可打开 [HTML 播放器](assets/promo/index.html) 播放最终视频。
 
 Connections, simplified.
 

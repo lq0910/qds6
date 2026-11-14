@@ -1,8 +1,8 @@
 //! 功能：SQL 语法关键字补全与已连接数据库的表名智能联想；时间：2026-11-13；作者：lq。
 
 // 功能：沿用 Kit 重导出的 GPUI 类型；时间：2026-11-13；作者：lq。
-use gpui_kit::gpui::{App, Task, Window};
 use gpui_kit::component::input::{CompletionProvider, RopeExt};
+use gpui_kit::gpui::{App, Task, Window};
 use lsp_types::{
     CompletionContext, CompletionItem, CompletionItemKind, CompletionResponse, TextEdit,
 };
@@ -165,11 +165,7 @@ impl CompletionProvider for SqlCompletionProvider {
 
         // 功能：表名补全：schema.name 整体匹配，优先于关键字排序；时间：2026-11-13；作者：lq。
         {
-            let guard = self
-                .table_names
-                .0
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let guard = self.table_names.0.lock().unwrap_or_else(|e| e.into_inner());
             for name in guard.iter() {
                 if name.to_lowercase().contains(&prefix) {
                     items.push(CompletionItem {

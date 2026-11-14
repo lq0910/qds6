@@ -1,6 +1,12 @@
-# 功能：Mac 优先阶段的编译及领域存储回归，Windows 适配阶段再加入矩阵；时间：2026-11-10；作者：lq。
+# 功能：Mac 双架构编译、领域存储回归及发布门禁，Windows 按独立阶段推进；时间：2026-11-13；作者：lq。
 name: QDS6 checks
-on: [push, pull_request, workflow_dispatch]
+# 功能：发布复用相同质量门禁，tag 推送不重复执行检查；时间：2026-11-13；作者：lq。
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
 permissions:
   contents: read
 jobs:
@@ -8,14 +14,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest]
+        os: [macos-15, macos-15-intel]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - run: python3 scripts/test-macos-release.py
       - run: cargo fmt --all -- --check
       - run: cargo test -p qds6-core -p qds6-storage -p qds6-services --locked
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings

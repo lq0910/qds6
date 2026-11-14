@@ -1,0 +1,28 @@
+{
+  "name": "qds6-launch-3d",
+  "version": "1.0.0",
+  "private": true,
+  "description": "QDS6 Three.js launch film — 2026-11-14 — lq",
+  "scripts": {
+    "studio": "remotion studio src/index.ts --port=3126",
+    "typecheck": "tsc --noEmit",
+    "assets": "node scripts/prepare-assets.mjs",
+    "render": "node scripts/render.mjs"
+  },
+  "dependencies": {
+    "@react-three/fiber": "8.18.0",
+    "@remotion/cli": "4.0.543",
+    "@remotion/media": "4.0.543",
+    "@remotion/three": "4.0.543",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "remotion": "4.0.543",
+    "three": "0.170.0"
+  },
+  "devDependencies": {
+    "@types/react": "18.3.31",
+    "@types/react-dom": "18.3.7",
+    "@types/three": "0.170.0",
+    "typescript": "5.9.3"
+  }
+}
