@@ -1,8 +1,11 @@
-# 功能：手动运行双架构 Mac 构建，全部成功后自动创建 tag 并发布内测安装包；时间：2026-11-13；作者：lq。
+# 功能：main 推送自动检查和双架构打包，全部成功后创建 tag 并发布内测安装包；时间：2026-11-14；作者：lq。
 name: QDS6 macOS release
 run-name: macOS release · ${{ github.ref_name }} · build ${{ github.run_number }}
 
 on:
+  # 功能：普通主分支提交即可发布，无需手动创建 tag，tag 推送不重复发布；时间：2026-11-14；作者：lq。
+  push:
+    branches: [main]
   workflow_dispatch:
     # 功能：默认无需 Apple 账号的 ad-hoc 内测，保留正式签名选项；时间：2026-11-13；作者：lq。
     inputs:
@@ -86,7 +89,8 @@ jobs:
     env:
       # 功能：两架构统一最低系统版本，原生 release 编译不启用测试功能；时间：2026-11-13；作者：lq。
       MACOSX_DEPLOYMENT_TARGET: '14.0'
-      SIGNING_MODE: ${{ inputs.signing_mode }}
+      # 功能：push 没有手动输入时默认 ad-hoc，手动发布保留正式签名选项；时间：2026-11-14；作者：lq。
+      SIGNING_MODE: ${{ inputs.signing_mode || 'adhoc' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -148,7 +152,8 @@ jobs:
       GH_REPO: ${{ github.repository }}
       RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
       PACKAGE_VERSION: ${{ needs.metadata.outputs.version }}
-      SIGNING_MODE: ${{ inputs.signing_mode }}
+      # 功能：发布校验与构建使用相同的自动签名默认值；时间：2026-11-14；作者：lq。
+      SIGNING_MODE: ${{ inputs.signing_mode || 'adhoc' }}
     steps:
       - uses: actions/checkout@v4
         with:

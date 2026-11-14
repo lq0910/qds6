@@ -71,7 +71,8 @@ python3 scripts/verify-macos-package.py output/release/0.1.0-macos-arm64-interna
 - `crates/qds6-storage`：SQLite schema 与事务存储，不接收密码。
 - `crates/qds6-services`：SSH/PTY、Alacritty、SFTP、SQLx 双适配器、Keychain、保守导入和加密恢复。
 - `crates/qds6-app`：GPUI Kit 原生 UI；文件与数据库 I/O 在后台执行。
-- `.github/workflows/ci.yml`：当前运行 macOS 编译、格式与回归检查；Windows 在 Mac 主要功能落地后启用。
+- `.github/workflows/ci.yml`：运行 macOS 编译、格式与回归检查；Windows 在 Mac 主要功能落地后启用。
+- `.github/workflows/release-macos.yml`：推送到 `main` 后自动检查、打包 Apple Silicon / Intel DMG 和 ZIP，创建 tag 并发布到 [Releases](https://github.com/lq0910/qds6/releases)；默认 ad-hoc 签名，支持手动重发及可选 Developer ID 签名。详见 [发布说明](docs/macos-release-workflow-20261113.md)。
 - [产品与技术方案](docs/产品与技术实施方案-20261110.md)
 - [开发任务](docs/开发任务与验收清单-20261110.md)
 - [导入导出与备份规范](docs/连接导入导出与备份规范-20261110.md)

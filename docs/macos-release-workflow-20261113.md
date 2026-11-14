@@ -1,10 +1,12 @@
 # macOS 双架构签名发布工作流
 
-功能说明：GitHub Actions 手动构建 Apple Silicon 和 Intel 安装包，默认使用 ad-hoc 测试签名并自动创建 tag 和 Release，可选 Developer ID 签名及 Apple 公证。日期：2026-11-13；作者：lq。
+功能说明：GitHub Actions 在 main 推送后自动构建 Apple Silicon 和 Intel 安装包，默认使用 ad-hoc 测试签名并自动创建 tag 和 Release，可选手动 Developer ID 签名及 Apple 公证。更新日期：2026-11-14；作者：lq。
 
 ## 使用方式
 
-将本次代码提交并推送到 `main`，在仓库 Actions 中选择 **QDS6 macOS release → Run workflow → main**。签名方式默认 `adhoc`，直接运行即可，无需 Apple 开发者账号、证书或 Secrets。普通 push 和 PR 运行 **QDS6 checks**，不会自动发布安装包。
+将代码提交并推送到 `main`，自动运行 **QDS6 macOS release**：先复用 **QDS6 checks** 完成双架构质量检查，再打包、创建 tag 并发布到仓库 **Releases**。自动发布默认 `adhoc`，无需 Apple 开发者账号、证书或 Secrets。其他分支 push 和 PR 只运行 **QDS6 checks**，不发布；tag 推送不会重复触发检查或发布。
+
+需要重新发布或选择正式签名时，可在 Actions 中选择 **QDS6 macOS release → Run workflow → main**，默认签名仍为 `adhoc`。main 的检查由发布流程调用，不再额外启动独立的 push 检查，避免重复编译。
 
 版本号读取 `Cargo.toml`，无需预先创建 tag。每次运行生成 `v<Cargo版本>-internal.<工作流运行序号>`，例如 `v0.1.0-internal.1`；两架构的 APP 构建号统一使用 GitHub run ID。重跑同一运行使用原 tag；如果该 Release 已经公开则拒绝修改，要重新打包应启动新运行。
 

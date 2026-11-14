@@ -1,9 +1,9 @@
 # 功能：Mac 双架构编译、领域存储回归及发布门禁，Windows 按独立阶段推进；时间：2026-11-13；作者：lq。
 name: QDS6 checks
-# 功能：发布复用相同质量门禁，tag 推送不重复执行检查；时间：2026-11-13；作者：lq。
+# 功能：main 由自动发布流程复用检查，其他分支及 PR 单独检查，tag 不重复触发；时间：2026-11-14；作者：lq。
 on:
   push:
-    branches: ['**']
+    branches-ignore: [main]
   pull_request:
   workflow_dispatch:
   workflow_call:
