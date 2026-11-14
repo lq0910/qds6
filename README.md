@@ -1,5 +1,9 @@
 # QDS6
 
+<a href="assets/promo/QDS6-Launch-3D-1080p.mp4"><img src="assets/promo/QDS6-Launch-3D-cover.png" alt="播放 QDS6 产品发布片：55.6 秒，1080p" width="720"></a>
+
+**QDS6 产品发布片 / 55.6 秒 / 1920 × 1080**：[播放或下载 MP4](assets/promo/QDS6-Launch-3D-1080p.mp4)
+
 Connections, simplified.
 
 连接，从此简单。
