@@ -337,11 +337,10 @@ fn ssh_smoke(root: &Path) {
     client
         .upload(&local, &remote, &Transfer::default())
         .unwrap();
-    assert!(
-        client
-            .upload(&local, &remote, &Transfer::default())
-            .is_err()
-    );
+    // 功能：同名上传应覆盖成功，专用 upload-overwrite-smoke 验证内容及权限；时间：2026-11-16；作者：lq。
+    client
+        .upload(&local, &remote, &Transfer::default())
+        .unwrap();
     let entries = client.list(Path::new(&remote_dir)).expect("directory list");
     assert_eq!(entries.len(), 1);
     let document = client.open_document(&remote).unwrap();
@@ -441,7 +440,7 @@ fn ssh_smoke(root: &Path) {
         Err(SshError::ChangedHost { .. })
     ));
     println!(
-        "PASS SSH/SFTP: first-host confirmation, changed-host blocking, PTY resize, Chinese/Vim/tmux, upload/download, no-overwrite, conflict blocking, permission, cancel and independent lifecycle"
+        "PASS SSH/SFTP: first-host confirmation, changed-host blocking, PTY resize, Chinese/Vim/tmux, upload/download, same-name overwrite, conflict blocking, permission, cancel and independent lifecycle"
     );
 }
 

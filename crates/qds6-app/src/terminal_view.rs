@@ -14,12 +14,19 @@ use qds6_core::TerminalTheme;
 use qds6_services::terminal::TerminalSession;
 use std::{ops::Range, time::Duration};
 
+// 功能：仅验收构建编译终端原生鼠标与剪贴板回归；时间：2026-11-16；作者：lq。
+#[cfg(feature = "ui-tests")]
+pub(crate) mod smoke;
+
 /// 功能：单终端视图与原生输入焦点独立管理；时间：2026-11-10；作者：lq。
 pub struct TerminalView {
     session: TerminalSession,
     focus: FocusHandle,
     preedit: String,
     selection: Range<usize>,
+    // 功能：输出选区与 IME 组合文本选区独立，命中检测使用实际画布边界；时间：2026-11-16；作者：lq。
+    grid_bounds: Option<Bounds<Pixels>>,
+    selecting_output: bool,
     columns: u16,
     rows: u16,
     font_size: f32,
@@ -98,6 +105,8 @@ impl TerminalView {
             focus: cx.focus_handle(),
             preedit: String::new(),
             selection: 0..0,
+            grid_bounds: None,
+            selecting_output: false,
             columns: 100,
             rows: 30,
             font_size: 14.,
@@ -112,10 +121,77 @@ impl TerminalView {
 
     /// 功能：输入失败可见，不在重连后重放；时间：2026-11-10；作者：lq。
     fn send(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        self.clear_output_selection();
         if let Err(error) = self.session.input(bytes) {
             self.status = error;
         }
         cx.notify();
+    }
+
+    /// 功能：按与绘制相同的网格尺寸命中字符及半格，越界拖动钳制到可见边缘；时间：2026-11-16；作者：lq。
+    fn output_position(&self, position: Point<Pixels>) -> Option<(usize, usize, bool)> {
+        let bounds = self.grid_bounds?;
+        let column = (f32::from(position.x - bounds.origin.x) / (self.font_size * 0.6))
+            .clamp(0., f32::from(self.columns) - 0.001);
+        let row = (f32::from(position.y - bounds.origin.y) / (self.font_size * 1.4))
+            .clamp(0., f32::from(self.rows) - 1.);
+        Some((row as usize, column as usize, column.fract() >= 0.5))
+    }
+
+    /// 功能：单击清除旧选区并开始拖选，双击选词、三击选行；时间：2026-11-16；作者：lq。
+    fn begin_output_selection(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus, cx);
+        if let Some((row, column, right)) = self.output_position(event.position) {
+            self.session
+                .model
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .begin_selection(row, column, right, event.click_count);
+            self.selecting_output = true;
+            cx.notify();
+        }
+    }
+
+    /// 功能：窗口级拖动和释放共用终点更新，避免拖出画布后选区卡住；时间：2026-11-16；作者：lq。
+    fn update_output_selection(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        if self.selecting_output
+            && let Some((row, column, right)) = self.output_position(position)
+        {
+            self.session
+                .model
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .update_selection(row, column, right);
+            cx.notify();
+        }
+    }
+
+    /// 功能：发送输入或粘贴时退出输出选择，不影响 IME 组合文本；时间：2026-11-16；作者：lq。
+    fn clear_output_selection(&mut self) {
+        self.selecting_output = false;
+        self.session
+            .model
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear_selection();
+    }
+
+    /// 功能：快捷键与原生编辑菜单共用选区复制，无选区时保留剪贴板；时间：2026-11-16；作者：lq。
+    fn copy_output(&mut self, whole_screen: bool, cx: &mut Context<Self>) {
+        let model = self.session.model.lock().unwrap_or_else(|e| e.into_inner());
+        let text = if whole_screen {
+            Some(model.text())
+        } else {
+            model.selected_text()
+        };
+        if let Some(text) = text {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
     }
 
     /// 功能：处理 PTY 控制键、应用光标键及复制粘贴；普通字符交由原生 IME；时间：2026-11-10；作者：lq。
@@ -127,16 +203,9 @@ impl TerminalView {
         if key.modifiers.platform {
             match key.key.as_str() {
                 "f" => self.toggle_search(window, cx),
-                "c" => {
-                    let text = self
-                        .session
-                        .model
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .text();
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
-                }
+                "c" => self.copy_output(key.modifiers.shift, cx),
                 "v" => {
+                    self.clear_output_selection();
                     if let Some(text) = cx.read_from_clipboard().and_then(|v| v.text())
                         && let Err(error) = self.session.paste(&text)
                     {
@@ -261,10 +330,11 @@ impl Render for TerminalView {
                     .track_focus(&self.focus)
                     .key_context("Terminal")
                     .on_key_down(cx.listener(Self::key))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| window.focus(&this.focus, cx)),
-                    )
+                    // 功能：系统“编辑 → 复制”与终端快捷键行为一致；时间：2026-11-16；作者：lq。
+                    .on_action(cx.listener(|this, _: &component::input::Copy, _, cx| {
+                        this.copy_output(false, cx);
+                        cx.stop_propagation();
+                    }))
                     .on_scroll(cx.listener(|this, event: &ScrollEvent, _, cx| {
                         let delta = event.delta.pixel_delta(px(20.)).y;
                         this.session
@@ -279,10 +349,16 @@ impl Render for TerminalView {
                             .id("terminal-content")
                             .test_support()
                             .size_full()
+                            .cursor_text()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(Self::begin_output_selection),
+                            )
                             .child(
                                 canvas(
                                     move |bounds, _, cx| {
                                         view.update(cx, |this, _| {
+                                            this.grid_bounds = Some(bounds);
                                             let columns = (f32::from(bounds.size.width)
                                                 / (font_size * 0.6))
                                                 .floor()
@@ -307,6 +383,42 @@ impl Render for TerminalView {
                                             &focus,
                                             ElementInputHandler::new(bounds, view.clone()),
                                             cx,
+                                        );
+                                        // 功能：捕获窗口级移动及释放，拖出网格后也能结束选区；时间：2026-11-16；作者：lq。
+                                        let drag_view = view.clone();
+                                        window.on_mouse_event(
+                                            move |event: &MouseMoveEvent, phase, _, cx| {
+                                                if phase.capture() {
+                                                    drag_view.update(cx, |this, cx| {
+                                                        if event.pressed_button
+                                                            == Some(MouseButton::Left)
+                                                        {
+                                                            this.update_output_selection(
+                                                                event.position,
+                                                                cx,
+                                                            );
+                                                        } else {
+                                                            this.selecting_output = false;
+                                                        }
+                                                    });
+                                                }
+                                            },
+                                        );
+                                        let release_view = view.clone();
+                                        window.on_mouse_event(
+                                            move |event: &MouseUpEvent, phase, _, cx| {
+                                                if phase.capture()
+                                                    && event.button == MouseButton::Left
+                                                {
+                                                    release_view.update(cx, |this, cx| {
+                                                        this.update_output_selection(
+                                                            event.position,
+                                                            cx,
+                                                        );
+                                                        this.selecting_output = false;
+                                                    });
+                                                }
+                                            },
                                         );
                                         let cell_width = font_size * 0.6;
                                         let cell_height = font_size * 1.4;
@@ -347,7 +459,10 @@ impl Render for TerminalView {
                                                         origin,
                                                         size: size(width, px(cell_height)),
                                                     },
-                                                    rgb(if matched {
+                                                    // 功能：选区高亮优先于搜索及光标，颜色随终端主题变化；时间：2026-11-16；作者：lq。
+                                                    rgb(if cell.selected {
+                                                        palette.cursor
+                                                    } else if matched {
                                                         palette.search_background
                                                     } else if cell.cursor {
                                                         palette.cursor
@@ -359,7 +474,9 @@ impl Render for TerminalView {
                                                 let run = TextRun {
                                                     len: cell.text.len(),
                                                     font,
-                                                    color: rgb(if matched {
+                                                    color: rgb(if cell.selected {
+                                                        palette.cursor_text
+                                                    } else if matched {
                                                         palette.search_foreground
                                                     } else if cell.cursor {
                                                         palette.cursor_text
@@ -426,7 +543,7 @@ impl Render for TerminalView {
                 v.child(Input::new(&self.search).aria_label("终端搜索"))
             })
             .child(h_flex().px_3().py_1().text_xs().child(format!(
-                "{status} · {}×{} · ⌘C 复制屏幕 / ⌘V 粘贴 / ⌘± 缩放",
+                "{status} · {}×{} · 拖选文字后 ⌘C 复制 / ⌘⇧C 复制屏幕 / ⌘V 粘贴 / ⌘± 缩放",
                 self.columns, self.rows
             )))
     }
@@ -539,6 +656,7 @@ impl EntityInputHandler for TerminalView {
     /// 功能：粘贴按终端 bracketed paste 协议处理；时间：2026-11-10；作者：lq。
     fn paste(&mut self, item: ClipboardItem, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = item.text() {
+            self.clear_output_selection();
             if let Err(error) = self.session.paste(&text) {
                 self.status = error;
             }

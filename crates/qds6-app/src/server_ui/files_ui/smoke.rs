@@ -429,10 +429,138 @@ pub fn run_sidebar_files_smoke() {
     println!(
         "PASS real SSH/SFTP: hidden-only, empty, mixed, missing directory; native reveal; 1440/960 sidebar; terminal padding; session/search/path retained"
     );
+    // 功能：同一原生文件面板继续验收批量覆盖上传与拖动覆盖；时间：2026-11-16；作者：lq。
+    verify_overwrite(
+        &mut cx,
+        handle,
+        &view,
+        &server,
+        &client,
+        &root,
+        &remote_root,
+    );
     cx.update_window(handle, |_, window, _| window.remove_window())
         .unwrap();
     drop(cx);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+/// 功能：按钮批量上传覆盖文件并合并目录，拖放同样覆盖且刷新远端列表；时间：2026-11-16；作者：lq。
+fn verify_overwrite(
+    cx: &mut HeadlessAppContext,
+    handle: AnyWindowHandle,
+    view: &Entity<Workbench>,
+    server: &Entity<ServerWorkspace>,
+    client: &sftp::Client,
+    root: &Path,
+    remote_root: &Path,
+) {
+    let local = root.join("overwrite");
+    let remote = remote_root.join("overwrite");
+    std::fs::create_dir_all(local.join("assets/empty")).unwrap();
+    client.mkdir(&remote).unwrap();
+    client.mkdir(&remote.join("assets")).unwrap();
+    let seed = root.join("overwrite-seed");
+    std::fs::write(&seed, "original remote").unwrap();
+    for name in [
+        "index.html",
+        "vite.svg",
+        "assets/app.js",
+        "assets/remote-only.txt",
+    ] {
+        client
+            .upload(&seed, &remote.join(name), &sftp::Transfer::default())
+            .unwrap();
+    }
+    client.chmod(&remote.join("index.html"), 0o644).unwrap();
+    for (name, content) in [
+        ("index.html", "replacement HTML 中文"),
+        ("vite.svg", "replacement SVG"),
+        ("assets/app.js", "replacement JS"),
+    ] {
+        std::fs::write(local.join(name), content).unwrap();
+    }
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |state, cx| {
+            state.activate_workspace(WorkspaceTarget::Server(0), cx)
+        });
+        server.update(cx, |state, cx| {
+            state.services.show_hidden = false;
+            state.files_visible = true;
+            state.services.files.show_local = true;
+            state.navigate_directory(FileSide::Local, local.clone(), window, cx);
+            state.navigate_directory(FileSide::Remote, remote.clone(), window, cx);
+        });
+    })
+    .unwrap();
+    settle(cx, handle, view);
+    cx.update_window(handle, |_, window, cx| {
+        window.click("select-all-local", cx);
+        window.click("upload", cx);
+    })
+    .unwrap();
+    settle(cx, handle, view);
+    for (name, content) in [
+        ("index.html", "replacement HTML 中文"),
+        ("vite.svg", "replacement SVG"),
+        ("assets/app.js", "replacement JS"),
+        ("assets/remote-only.txt", "original remote"),
+    ] {
+        assert_eq!(
+            client.open_document(&remote.join(name)).unwrap().text,
+            content
+        );
+    }
+    assert!(
+        client
+            .list(&remote.join("assets/empty"))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        client
+            .list(&remote)
+            .unwrap()
+            .iter()
+            .find(|entry| entry.name == "index.html")
+            .unwrap()
+            .permissions
+            & 0o777,
+        0o644
+    );
+    cx.update(|cx| {
+        let state = server.read(cx);
+        assert!(!state.error, "{}", state.status);
+        assert!(
+            state
+                .services
+                .files
+                .history
+                .iter()
+                .take(3)
+                .all(|item| item.contains("已完成"))
+        );
+    });
+    std::fs::write(local.join("vite.svg"), "drag replacement SVG").unwrap();
+    cx.update_window(handle, |_, window, cx| {
+        let row = server.read(cx).file_row(false, &local.join("vite.svg"), cx);
+        window.click(row, cx);
+        window.drag_to(row, "remote-files-drop", cx);
+    })
+    .unwrap();
+    settle(cx, handle, view);
+    assert_eq!(
+        client.open_document(&remote.join("vite.svg")).unwrap().text,
+        "drag replacement SVG"
+    );
+    cx.update(|cx| assert!(!server.read(cx).error, "{}", server.read(cx).status));
+    cx.capture_screenshot(handle)
+        .unwrap()
+        .save("output/sidebar-files/upload-overwrite.png")
+        .unwrap();
+    println!(
+        "PASS native overwrite upload: multi-selection upload button, same-name folder merge, remote-only files, permissions, drag replacement and target list refresh"
+    );
 }
 
 /// 功能：真实原生点击、多选、目录层级和批量双向拖放，通过内容校验确认落地；时间：2026-11-11；作者：lq。

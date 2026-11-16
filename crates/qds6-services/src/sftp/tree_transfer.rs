@@ -1,4 +1,4 @@
-//! 功能：有界目录传输，不跟随链接、拒绝覆盖，失败清理本次创建的目标；时间：2026-11-11；作者：lq。
+//! 功能：有界目录传输，上传支持合并与同名文件原子覆盖，下载保持排他发布；时间：2026-11-16；作者：lq。
 use super::*;
 
 /// 功能：先验证整棵源树，再开始创建目标，限制层级和节点总数；时间：2026-11-11；作者：lq。
@@ -97,7 +97,7 @@ impl Plan {
 }
 
 impl Client {
-    /// 功能：文件直接上传，文件夹先传排他暂存目录再无覆盖重命名；时间：2026-11-11；作者：lq。
+    /// 功能：已有文件夹合并上传，保留远端独有内容；新文件夹暂存完成后发布；时间：2026-11-16；作者：lq。
     pub fn upload_path(
         &self,
         local: &Path,
@@ -109,12 +109,15 @@ impl Client {
         if plan.directories.is_empty() {
             return self.upload(local, remote, progress);
         }
-        if self.sftp.lstat(remote).is_ok() {
-            return Err("目标已存在，请重命名源项或选择其他目录".into());
-        }
-        let temporary = temporary_path(remote)?;
         progress.total.store(plan.bytes, Ordering::Relaxed);
         progress.completed.store(0, Ordering::Relaxed);
+        if let Some(stat) = self.upload_target(remote)? {
+            if !stat.is_dir() {
+                return Err("上传文件夹与目标类型冲突；目标不是普通目录".into());
+            }
+            return self.merge_upload(local, remote, &plan, progress);
+        }
+        let temporary = temporary_path(remote)?;
         self.mkdir(&temporary)?;
         let result = (|| {
             for directory in plan.directories.iter().skip(1) {
@@ -142,6 +145,48 @@ impl Client {
             });
         }
         Ok(())
+    }
+
+    /// 功能：先预检整棵目标树的类型，再逐文件原子覆盖，失败不回删已完成文件；时间：2026-11-16；作者：lq。
+    fn merge_upload(
+        &self,
+        local: &Path,
+        remote: &Path,
+        plan: &Plan,
+        progress: &Transfer,
+    ) -> Result<(), String> {
+        for directory in &plan.directories {
+            progress.check()?;
+            if self
+                .upload_target(&remote.join(directory))?
+                .is_some_and(|stat| !stat.is_dir())
+            {
+                return Err(format!(
+                    "上传目录与文件或链接冲突：{}",
+                    remote.join(directory).display()
+                ));
+            }
+        }
+        for file in &plan.files {
+            progress.check()?;
+            self.upload_file_target(&remote.join(file))?;
+        }
+        let result = (|| {
+            for directory in plan.directories.iter().skip(1) {
+                progress.check()?;
+                let path = remote.join(directory);
+                match self.upload_target(&path)? {
+                    Some(stat) if stat.is_dir() => {}
+                    Some(_) => return Err(format!("上传目录类型已变化：{}", path.display())),
+                    None => self.mkdir(&path)?,
+                }
+            }
+            for file in &plan.files {
+                self.upload_file(&local.join(file), &remote.join(file), progress, false)?;
+            }
+            Ok(())
+        })();
+        result.map_err(|error: String| format!("{error}；目录合并已完成的文件保留，可重新上传继续"))
     }
 
     /// 功能：目录下载排他创建根目录，失败清理本次目标，保留已有同名内容；时间：2026-11-11；作者：lq。

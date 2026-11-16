@@ -1,6 +1,8 @@
 //! 功能：只改变测试进程自身的原生外观，验证自动响应及手动优先级；时间：2026-11-11；作者：lq。
 
 use super::*;
+// 功能：以原生鼠标入口验收标题栏切换及模式文案；时间：2026-11-16；作者：lq。
+use gpui_kit::test::TestWindowExt;
 use std::time::Duration;
 
 /// 功能：用隔离数据库和真实 macOS 外观通知验收，不修改系统全局主题；时间：2026-11-11；作者：lq。
@@ -82,8 +84,41 @@ pub fn run_appearance_smoke() {
                     assert_eq!(palette.1, 19.);
                     assert_eq!(terminal.screen_text(), output);
                 });
+                // 功能：自动模式随系统改变亮度，但标题栏必须继续显示自动；时间：2026-11-16；作者：lq。
+                cx.update_window(handle, |_, window, cx| {
+                    window.render_frame(cx);
+                    let label = match theme {
+                        ColorTheme::Light => "浅色",
+                        ColorTheme::Dark => "深色",
+                        ColorTheme::System => "自动",
+                    };
+                    assert_eq!(window.find("theme").label(), Some(label));
+                }).unwrap();
                 println!("PASS native appearance: preference={theme:?}, appearance={appearance:?}, theme={expected:?}");
             }
+            // 功能：真实点击标题栏，核对持久化完成后的当前模式及已有终端联动；时间：2026-11-16；作者：lq。
+            for (theme, label, expected) in [
+                (ColorTheme::Light, "浅色", ThemeMode::Light),
+                (ColorTheme::Dark, "深色", ThemeMode::Dark),
+                (ColorTheme::System, "自动", ThemeMode::Dark),
+            ] {
+                cx.update_window(handle, |_, window, cx| window.click("theme", cx)).unwrap();
+                for attempt in 0..100 {
+                    cx.background_executor().timer(Duration::from_millis(50)).await;
+                    if cx.update(|cx| !view.read(cx).settings.saving) { break; }
+                    assert!(attempt < 99, "native title theme save did not finish");
+                }
+                cx.update_window(handle, |_, window, cx| {
+                    window.render_frame(cx);
+                    assert_eq!(view.read(cx).settings.preferences.theme, theme);
+                    assert_eq!(window.find("theme").label(), Some(label));
+                    assert_eq!(cx.theme().mode, expected);
+                    assert_eq!(terminal.read(cx).appearance().0.is_dark(), expected == ThemeMode::Dark);
+                    assert_eq!(terminal.read(cx).appearance().1, 19.);
+                    assert_eq!(terminal.read(cx).screen_text(), output);
+                }).unwrap();
+            }
+            println!("PASS native title theme: three-state clicks, current label, saved preference and existing terminal follow appearance");
             // 功能：显式固定终端配色后，软件和系统外观切换均不覆盖；时间：2026-11-11；作者：lq。
             for appearance in [WindowAppearance::Light, WindowAppearance::Dark] {
                 cx.update_window(handle, |_, window, cx| {

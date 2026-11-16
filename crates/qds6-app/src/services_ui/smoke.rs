@@ -326,8 +326,12 @@ pub fn run_service_ui_smoke() {
             .text,
         "selected transfer\n"
     );
-    // 功能：重复上传拒绝覆盖，原始远程内容保持一致；时间：2026-11-11；作者：lq。
-    std::fs::write(files_root.join("按钮上传.txt"), "must not overwrite").unwrap();
+    // 功能：同名上传替换远端文件，目录同名策略由服务层测试验证；时间：2026-11-16；作者：lq。
+    std::fs::write(
+        files_root.join("按钮上传.txt"),
+        "replace selected transfer 中文\n",
+    )
+    .unwrap();
     cx.update_window(handle, |_, window, cx| window.click("upload", cx))
         .unwrap();
     settle(&mut cx, handle, &view);
@@ -336,9 +340,9 @@ pub fn run_service_ui_smoke() {
             .open_document(&remote_root.join("服务器目录/按钮上传.txt"))
             .unwrap()
             .text,
-        "selected transfer\n"
+        "replace selected transfer 中文\n"
     );
-    assert!(cx.update(|cx| first.read(cx).status.to_string().contains("失败")));
+    assert!(cx.update(|cx| first.read(cx).status.to_string().contains("已完成")));
     // 功能：按钮下载明确传入本地当前目录；时间：2026-11-11；作者：lq。
     cx.update_window(handle, |_, window, cx| {
         let target = first
@@ -360,7 +364,7 @@ pub fn run_service_ui_smoke() {
     settle(&mut cx, handle, &view);
     assert_eq!(
         std::fs::read_to_string(files_root.join("下载内容/按钮上传.txt")).unwrap(),
-        "selected transfer\n"
+        "replace selected transfer 中文\n"
     );
     // 功能：模拟其他远程操作占用任务槽后，以原生拖动验证排队和清空；时间：2026-11-11；作者：lq。
     cx.update_window(handle, |_, window, cx| {
@@ -452,7 +456,7 @@ pub fn run_service_ui_smoke() {
         "双向传输中文验证\n"
     );
     println!(
-        "PASS file explorer: enter/parent, bidirectional file/folder drag, selection upload/download, nested bytes, empty folders, collision keeps target, queue/clear/cancel, blank-pane drop"
+        "PASS file explorer: enter/parent, bidirectional file/folder drag, selection upload/download, atomic same-name replacement, nested bytes, empty folders, queue/clear/cancel, blank-pane drop"
     );
     // 功能：首个 SSH 连接直接展示三面板，两种逻辑视口都重新布局；时间：2026-11-11；作者：lq。
     cx.update_window(handle, |_, window, cx| {

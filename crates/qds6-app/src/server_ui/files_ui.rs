@@ -431,7 +431,7 @@ impl ServerWorkspace {
         self.enqueue_batch(side, entries, destination, window, cx);
     }
 
-    /// 功能：排队时冻结路径，不覆盖同名目标，拒绝符号链接及重复任务；时间：2026-11-11；作者：lq。
+    /// 功能：排队冻结路径，上传合并目录并覆盖同名文件，拒绝符号链接及重复任务；时间：2026-11-16；作者：lq。
     fn enqueue_transfer(
         &mut self,
         side: FileSide,
@@ -637,7 +637,12 @@ impl ServerWorkspace {
                         } else {
                             "← 下载"
                         })
-                        .tooltip(format!("传入 {}", target.display()))
+                        // 功能：上传前明确同名处理规则，拖放与按钮共用后台提交；时间：2026-11-16；作者：lq。
+                        .tooltip(if side == FileSide::Local {
+                            format!("上传到 {}；同名文件覆盖，文件夹合并", target.display())
+                        } else {
+                            format!("下载到 {}", target.display())
+                        })
                         .disabled(browser.selection.is_empty())
                         .on_click(cx.listener(
                             move |this, _, window, cx| this.transfer_selected(side, window, cx),

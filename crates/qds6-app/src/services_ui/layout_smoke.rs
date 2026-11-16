@@ -74,6 +74,24 @@ fn settle_preferences(cx: &mut HeadlessAppContext, view: &Entity<Workbench>) {
     }
 }
 
+/// 功能：核对标题栏当前模式、设置选中项和实际亮度，自动模式不误标为浅色或深色；时间：2026-11-16；作者：lq。
+fn assert_theme_controls(window: &mut Window, theme: qds6_storage::ColorTheme, cx: &App) {
+    use qds6_storage::ColorTheme;
+    let (index, label, mode) = match theme {
+        ColorTheme::Light => (0usize, "浅色", ThemeMode::Light),
+        ColorTheme::Dark => (1usize, "深色", ThemeMode::Dark),
+        ColorTheme::System => (2usize, "自动", ThemeMode::from(window.appearance())),
+    };
+    assert_eq!(window.find("theme").label(), Some(label));
+    for option in 0..3 {
+        assert_eq!(
+            window.within("settings-theme").find(option).selected(),
+            Some(option == index)
+        );
+    }
+    assert_eq!(cx.theme().mode, mode);
+}
+
 /// 功能：验证可操作布局而非只核对构造代码，不连接用户服务；时间：2026-11-11；作者：lq。
 pub fn run_layout_smoke() {
     std::fs::create_dir_all("output/ui-layout").unwrap();
@@ -481,6 +499,11 @@ pub fn run_layout_smoke() {
         })
         .unwrap();
         settle_preferences(&mut cx, &view);
+        cx.update_window(handle, |_, window, cx| {
+            window.render_frame(cx);
+            assert_theme_controls(window, qds6_storage::ColorTheme::Light, cx);
+        })
+        .unwrap();
         capture(&mut cx, handle, &format!("settings-light-{tag}"));
         // 功能：真实点击自动选项和标题栏三态循环，检查即时外观及 SQLite 保存；时间：2026-11-11；作者：lq。
         cx.update_window(handle, |_, window, cx| {
@@ -495,6 +518,7 @@ pub fn run_layout_smoke() {
             );
             assert_eq!(cx.theme().mode, ThemeMode::from(window.appearance()));
             assert!(window.within("settings-theme").find(2usize).visible());
+            assert_theme_controls(window, qds6_storage::ColorTheme::System, cx);
         })
         .unwrap();
         capture(&mut cx, handle, &format!("settings-auto-{tag}"));
@@ -514,9 +538,40 @@ pub fn run_layout_smoke() {
                     qds6_storage::ColorTheme::System => ThemeMode::from(window.appearance()),
                 };
                 assert_eq!(cx.theme().mode, expected);
+                window.render_frame(cx);
+                assert_theme_controls(window, theme, cx);
             })
             .unwrap();
         }
+        // 功能：反向从设置页逐项切换，标题栏即时匹配且每种模式正确落盘；时间：2026-11-16；作者：lq。
+        for (index, theme) in [
+            (0usize, qds6_storage::ColorTheme::Light),
+            (1usize, qds6_storage::ColorTheme::Dark),
+            (2usize, qds6_storage::ColorTheme::System),
+        ] {
+            cx.update_window(handle, |_, window, cx| {
+                window.within("settings-theme").click(index, cx);
+            })
+            .unwrap();
+            settle_preferences(&mut cx, &view);
+            cx.update_window(handle, |_, window, cx| {
+                window.render_frame(cx);
+                assert_theme_controls(window, theme, cx);
+                assert_eq!(view.read(cx).settings.preferences.theme, theme);
+            })
+            .unwrap();
+            assert_eq!(
+                ProfileStore::open(temporary.join("connections.sqlite3"))
+                    .unwrap()
+                    .preferences()
+                    .unwrap()
+                    .theme,
+                theme
+            );
+        }
+        println!(
+            "PASS theme controls {tag}: title current label, settings selected mode, bidirectional switching, appearance and SQLite persistence"
+        );
         // 功能：仅显式启用时真实点击更新检查，普通布局回归不依赖公网；时间：2026-11-11；作者：lq。
         if width == 1200. && std::env::var("QDS6_LIVE_UPDATE_CHECK").as_deref() == Ok("1") {
             cx.update_window(handle, |_, window, cx| {
@@ -726,6 +781,8 @@ pub fn run_layout_smoke() {
     println!(
         "PASS terminal themes: four native previews, existing output and temporary font size retained, persisted selection"
     );
+    // 功能：复用离线演示终端验收真实鼠标选区及复制；时间：2026-11-16；作者：lq。
+    crate::terminal_view::smoke::verify(&mut cx, handle, &terminal);
     // 功能：重建工作台验证启动读取真实保存的偏好，而非仅检查数据库内容；时间：2026-11-11；作者：lq。
     let expected = cx.update(|cx| view.read(cx).settings.preferences.clone());
     let reloaded = cx

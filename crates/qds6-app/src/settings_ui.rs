@@ -257,6 +257,18 @@ impl Workbench {
         self.sync_terminal_appearance(cx);
     }
 
+    /// 功能：标题栏与设置页共用模式切换及保存入口，统一外观、终端联动和持久化；时间：2026-11-16；作者：lq。
+    pub(super) fn set_color_theme(
+        &mut self,
+        theme: ColorTheme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut preferences = self.settings.preferences.clone();
+        preferences.theme = theme;
+        self.save_preferences(preferences, window, cx);
+    }
+
     /// 功能：后台原子保存，成功后应用，失败保留原偏好并明确反馈；时间：2026-11-11；作者：lq。
     pub(super) fn save_preferences(
         &mut self,
@@ -377,13 +389,12 @@ impl Workbench {
             .child(Tab::new().label("深色").disabled(disabled))
             .child(Tab::new().label("自动").disabled(disabled))
             .on_click(cx.listener(|this, index: &usize, window, cx| {
-                let mut preferences = this.settings.preferences.clone();
-                preferences.theme = match *index {
+                let theme = match *index {
                     0 => ColorTheme::Light,
                     1 => ColorTheme::Dark,
                     _ => ColorTheme::System,
                 };
-                this.save_preferences(preferences, window, cx);
+                this.set_color_theme(theme, window, cx);
             }));
         let font = h_flex()
             .gap_2()

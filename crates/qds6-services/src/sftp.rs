@@ -287,7 +287,7 @@ impl Client {
             }
         }
         if !supported {
-            return Err("服务器未提供 posix-rename 原子替换扩展，草稿已保留".into());
+            return Err("服务器未提供 posix-rename 原子替换扩展，原文件未替换".into());
         }
         let source = source.to_str().ok_or("源路径不是 UTF-8")?;
         let target = target.to_str().ok_or("目标路径不是 UTF-8")?;
@@ -353,12 +353,33 @@ impl Client {
             .map_err(|_| "权限修改失败".into())
     }
 
-    /// 功能：上传至排他临时文件并在成功后无覆盖重命名；时间：2026-11-10；作者：lq。
+    /// 功能：先上传同目录临时文件，同名普通文件完成后原子覆盖；时间：2026-11-16；作者：lq。
     pub fn upload(&self, local: &Path, remote: &Path, progress: &Transfer) -> Result<(), String> {
         self.upload_file(local, remote, progress, true)
     }
 
-    /// 功能：单文件与文件夹传输共用排他上传，目录任务累计字节；时间：2026-11-11；作者：lq。
+    /// 功能：区分目标缺失与权限或网络错误，禁止把读取失败当作新文件；时间：2026-11-16；作者：lq。
+    fn upload_target(&self, path: &Path) -> Result<Option<FileStat>, String> {
+        match self.sftp.lstat(path) {
+            Ok(stat) => Ok(Some(stat)),
+            Err(error) if error.code() == ssh2::ErrorCode::SFTP(2) => Ok(None),
+            Err(_) => Err(format!("无法检查上传目标属性：{}", path.display())),
+        }
+    }
+
+    /// 功能：上传只替换普通文件，目录、链接与设备冲突明确报错；时间：2026-11-16；作者：lq。
+    fn upload_file_target(&self, path: &Path) -> Result<Option<FileStat>, String> {
+        let stat = self.upload_target(path)?;
+        if stat.as_ref().is_some_and(|stat| !stat.is_file()) {
+            return Err(format!(
+                "上传目标不是普通文件，无法覆盖：{}",
+                path.display()
+            ));
+        }
+        Ok(stat)
+    }
+
+    /// 功能：文件与目录任务共用临时上传，保留同名目标权限及属主后原子提交；时间：2026-11-16；作者：lq。
     fn upload_file(
         &self,
         local: &Path,
@@ -383,6 +404,7 @@ impl Client {
             progress.total.store(metadata.len(), Ordering::Relaxed);
             progress.completed.store(0, Ordering::Relaxed);
         }
+        self.upload_file_target(remote)?;
         let temporary = temporary_path(remote)?;
         let result = (|| {
             let mut output = self
@@ -395,11 +417,33 @@ impl Client {
                 )
                 .map_err(|_| "无法创建远程临时文件")?;
             copy(&mut input, &mut output, progress)?;
+            // 功能：提交前重新检查目标类型；覆盖保留远端权限和属主，不沿用临时文件的 0600；时间：2026-11-16；作者：lq。
+            let target = self.upload_file_target(remote)?;
+            if let Some(stat) = &target {
+                let permissions = stat.perm.ok_or("无法读取原文件权限，未覆盖目标")? & 0o7777;
+                if stat.uid.is_none() || stat.gid.is_none() {
+                    return Err("无法读取原文件属主，未覆盖目标".into());
+                }
+                output
+                    .setstat(FileStat {
+                        size: None,
+                        uid: stat.uid,
+                        gid: stat.gid,
+                        perm: Some(permissions),
+                        atime: None,
+                        mtime: None,
+                    })
+                    .map_err(|_| "无法保留原文件权限或属主，未覆盖目标")?;
+            }
             output.close().map_err(|_| "远程关闭失败")?;
             progress.check()?;
-            self.sftp
-                .rename(&temporary, remote, Some(RenameFlags::empty()))
-                .map_err(|_| "上传提交失败；不会覆盖现有目标".into())
+            if target.is_some() {
+                self.posix_replace(&temporary, remote)
+            } else {
+                self.sftp
+                    .rename(&temporary, remote, Some(RenameFlags::empty()))
+                    .map_err(|_| "上传提交失败；请检查目录权限或重试".into())
+            }
         })();
         if result.is_err() {
             let _ = self.sftp.unlink(&temporary);

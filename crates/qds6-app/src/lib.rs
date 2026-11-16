@@ -1299,16 +1299,16 @@ impl Render for Workbench {
                             Button::new("theme")
                                 .ghost()
                                 .small()
-                                // 功能：标题栏快捷入口循环浅色、深色和自动，沿用后台持久化路径；时间：2026-11-11；作者：lq。
+                                // 功能：与设置页一致显示当前模式，点击仍按浅色、深色、自动循环；时间：2026-11-16；作者：lq。
                                 .icon(match self.settings.preferences.theme {
-                                    qds6_storage::ColorTheme::Light => UiIcon::Moon,
-                                    qds6_storage::ColorTheme::Dark => UiIcon::RefreshCw,
-                                    qds6_storage::ColorTheme::System => UiIcon::Sun,
+                                    qds6_storage::ColorTheme::Light => UiIcon::Sun,
+                                    qds6_storage::ColorTheme::Dark => UiIcon::Moon,
+                                    qds6_storage::ColorTheme::System => UiIcon::RefreshCw,
                                 })
                                 .label(match self.settings.preferences.theme {
-                                    qds6_storage::ColorTheme::Light => "深色",
-                                    qds6_storage::ColorTheme::Dark => "自动",
-                                    qds6_storage::ColorTheme::System => "浅色",
+                                    qds6_storage::ColorTheme::Light => "浅色",
+                                    qds6_storage::ColorTheme::Dark => "深色",
+                                    qds6_storage::ColorTheme::System => "自动",
                                 })
                                 .tooltip(match self.settings.preferences.theme {
                                     qds6_storage::ColorTheme::Light => "当前：浅色；切换为深色",
@@ -1321,8 +1321,7 @@ impl Render for Workbench {
                                 })
                                 .disabled(!self.settings.ready || self.settings.saving)
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    let mut preferences = this.settings.preferences.clone();
-                                    preferences.theme = match preferences.theme {
+                                    let theme = match this.settings.preferences.theme {
                                         qds6_storage::ColorTheme::Light => {
                                             qds6_storage::ColorTheme::Dark
                                         }
@@ -1333,7 +1332,7 @@ impl Render for Workbench {
                                             qds6_storage::ColorTheme::Light
                                         }
                                     };
-                                    this.save_preferences(preferences, window, cx);
+                                    this.set_color_theme(theme, window, cx);
                                 })),
                         ),
                 ),

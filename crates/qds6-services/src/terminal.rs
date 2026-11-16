@@ -4,6 +4,9 @@ use alacritty_terminal::{
     Term,
     event::{Event, EventListener},
     grid::{Dimensions, Scroll},
+    // 功能：复用终端原生选区以正确处理回滚、软换行和宽字符；时间：2026-11-16；作者：lq。
+    index::{Column, Line, Point, Side},
+    selection::{Selection, SelectionType},
     term::{Config, TermMode, cell::Flags},
     vte::ansi::{Color, NamedColor, Processor},
 };
@@ -52,6 +55,8 @@ pub struct Cell {
     pub bold: bool,
     pub underline: bool,
     pub cursor: bool,
+    // 功能：将原生选区映射到绘制快照；时间：2026-11-16；作者：lq。
+    pub selected: bool,
 }
 
 /// 功能：UI 快照在锁外绘制，网络 worker 不进入 GPUI；时间：2026-11-10；作者：lq。
@@ -141,6 +146,51 @@ impl Model {
         self.term.mode().contains(TermMode::APP_CURSOR)
     }
 
+    /// 功能：把可视网格位置换算为含历史偏移的终端坐标；时间：2026-11-16；作者：lq。
+    fn selection_point(&self, row: usize, column: usize) -> Point {
+        Point::new(
+            Line(
+                row.min(self.term.screen_lines() - 1) as i32
+                    - self.term.grid().display_offset() as i32,
+            ),
+            Column(column.min(self.term.columns() - 1)),
+        )
+    }
+
+    /// 功能：单击开始拖选，双击选词，三击选行，沿用 Alacritty 字符边界；时间：2026-11-16；作者：lq。
+    pub fn begin_selection(&mut self, row: usize, column: usize, right: bool, clicks: usize) {
+        let kind = match clicks {
+            2 => SelectionType::Semantic,
+            3.. => SelectionType::Lines,
+            _ => SelectionType::Simple,
+        };
+        self.term.selection = Some(Selection::new(
+            kind,
+            self.selection_point(row, column),
+            if right { Side::Right } else { Side::Left },
+        ));
+    }
+
+    /// 功能：拖动更新选区，支持反向和跨行选取；时间：2026-11-16；作者：lq。
+    pub fn update_selection(&mut self, row: usize, column: usize, right: bool) {
+        let point = self.selection_point(row, column);
+        if let Some(selection) = &mut self.term.selection {
+            selection.update(point, if right { Side::Right } else { Side::Left });
+        }
+    }
+
+    /// 功能：输入命令后清除旧选区，避免继续复制旧输出；时间：2026-11-16；作者：lq。
+    pub fn clear_selection(&mut self) {
+        self.term.selection = None;
+    }
+
+    /// 功能：仅提取选中文字，保留硬换行并合并终端软换行；时间：2026-11-16；作者：lq。
+    pub fn selected_text(&self) -> Option<String> {
+        self.term
+            .selection_to_string()
+            .filter(|text| !text.is_empty())
+    }
+
     /// 功能：从可视网格复制有界屏幕；时间：2026-11-10；作者：lq。
     pub fn text(&self) -> String {
         self.frame()
@@ -193,6 +243,13 @@ impl Model {
                 underline: source.flags.contains(Flags::UNDERLINE),
                 cursor: content.cursor.point == indexed.point
                     && self.term.mode().contains(TermMode::SHOW_CURSOR),
+                // 功能：宽字符任意半格被选中时整字高亮；时间：2026-11-16；作者：lq。
+                selected: content.selection.is_some_and(|selection| {
+                    selection.contains(indexed.point)
+                        || (source.flags.contains(Flags::WIDE_CHAR)
+                            && selection
+                                .contains(Point::new(indexed.point.line, indexed.point.column + 1)))
+                }),
             });
         }
         Frame {
@@ -436,6 +493,82 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// 功能：验证局部、反向、多行选区及单击清空，避免复制整屏回归；时间：2026-11-16；作者：lq。
+    #[test]
+    fn output_selection_copies_only_selected_cells_in_both_directions() {
+        let mut model = Model::new(80, 24);
+        model.feed(b"alpha beta gamma\r\nnext line");
+        model.begin_selection(0, 6, false, 1);
+        assert_eq!(model.selected_text(), None);
+        model.update_selection(0, 9, true);
+        assert_eq!(model.selected_text().as_deref(), Some("beta"));
+        let frame = model.frame();
+        assert!(!frame.rows[0][5].selected);
+        assert!(frame.rows[0][6..10].iter().all(|cell| cell.selected));
+        assert!(!frame.rows[0][10].selected);
+        model.begin_selection(0, 9, true, 1);
+        model.update_selection(0, 6, false);
+        assert_eq!(model.selected_text().as_deref(), Some("beta"));
+        model.update_selection(1, 3, true);
+        assert_eq!(model.selected_text().as_deref(), Some(" gamma\nnext"));
+        model.clear_selection();
+        assert_eq!(model.selected_text(), None);
+        assert!(
+            model
+                .frame()
+                .rows
+                .iter()
+                .flatten()
+                .all(|cell| !cell.selected)
+        );
+    }
+
+    /// 功能：宽字符半格及组合字符复制完整，软换行合并、硬换行保留；时间：2026-11-16；作者：lq。
+    #[test]
+    fn output_selection_preserves_unicode_and_terminal_line_breaks() {
+        let mut model = Model::new(20, 5);
+        model.feed("A中文e\u{301}Z".as_bytes());
+        model.begin_selection(0, 2, false, 1);
+        model.update_selection(0, 5, true);
+        assert_eq!(model.selected_text().as_deref(), Some("中文e\u{301}"));
+        assert!(model.frame().rows[0][1].selected);
+
+        let mut model = Model::new(20, 5);
+        model.feed(b"01234567890123456789wrapped\r\nnext");
+        model.begin_selection(0, 15, false, 1);
+        model.update_selection(1, 6, true);
+        assert_eq!(model.selected_text().as_deref(), Some("56789wrapped"));
+        model.update_selection(2, 3, true);
+        assert_eq!(model.selected_text().as_deref(), Some("56789wrapped\nnext"));
+    }
+
+    /// 功能：回滚中的选区随历史定位，双击选词和三击选行保持终端语义；时间：2026-11-16；作者：lq。
+    #[test]
+    fn output_selection_handles_scrollback_words_and_lines() {
+        let mut model = Model::new(20, 5);
+        model.feed(b"alpha beta\r\nline1\r\nline2\r\nline3\r\nline4\r\nline5");
+        model.scroll(1);
+        model.begin_selection(0, 7, false, 2);
+        assert_eq!(model.selected_text().as_deref(), Some("beta"));
+        assert!(
+            model.frame().rows[0][6..10]
+                .iter()
+                .all(|cell| cell.selected)
+        );
+        model.scroll(-1);
+        assert_eq!(model.selected_text().as_deref(), Some("beta"));
+        assert!(
+            model
+                .frame()
+                .rows
+                .iter()
+                .flatten()
+                .all(|cell| !cell.selected)
+        );
+        model.begin_selection(0, 2, false, 3);
+        assert_eq!(model.selected_text().as_deref(), Some("line1\n"));
+    }
+
     /// 功能：验证光标定位、备用屏幕、宽字符与回滚上限；时间：2026-11-10；作者：lq。
     #[test]
     fn vt_state_machine_handles_fullscreen_and_wide_text() {
