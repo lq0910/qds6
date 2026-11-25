@@ -257,6 +257,9 @@ impl ServerWorkspace {
                 let toggle_view = view.clone();
                 let toggle_path = path.clone();
                 let click_view = view.clone();
+                // 功能：系统拖入树节点时上传到该节点，而非当前打开目录；时间：2026-11-24；作者：lq。
+                let drop_view = view.clone();
+                let drop_path = path.clone();
                 ListItem::new(("remote-directory", index))
                     .h(px(28.))
                     .py_0()
@@ -316,19 +319,34 @@ impl ServerWorkspace {
                             ),
                     )
                     .when(valid, |v| {
-                        v.on_click(move |_, window, cx| {
-                            cx.stop_propagation();
-                            click_view.update(cx, |this, cx| {
-                                if this.services.files.remote.current != path {
-                                    this.navigate_directory(
-                                        FileSide::Remote,
-                                        path.clone(),
+                        v.can_drop(|data, _, _| data.is::<ExternalPaths>())
+                            .drag_over::<ExternalPaths>(|style, _, _, cx| {
+                                style.bg(cx.theme().accent)
+                            })
+                            .on_drop(move |paths: &ExternalPaths, window, cx| {
+                                cx.stop_propagation();
+                                drop_view.update(cx, |this, cx| {
+                                    this.enqueue_external_upload(
+                                        paths,
+                                        drop_path.clone(),
                                         window,
                                         cx,
                                     );
-                                }
-                            });
-                        })
+                                });
+                            })
+                            .on_click(move |_, window, cx| {
+                                cx.stop_propagation();
+                                click_view.update(cx, |this, cx| {
+                                    if this.services.files.remote.current != path {
+                                        this.navigate_directory(
+                                            FileSide::Remote,
+                                            path.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                });
+                            })
                     })
             }))
             .into_any_element()

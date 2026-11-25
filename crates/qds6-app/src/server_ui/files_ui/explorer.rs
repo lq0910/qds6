@@ -488,10 +488,21 @@ impl ServerWorkspace {
             row
         };
         if entry.directory && !entry.symlink {
+            // 功能：系统文件拖到远端文件夹行时以该子目录为落点；时间：2026-11-24；作者：lq。
+            let external_directory = entry.path.clone();
             row.can_drop(move |data, _, _| {
-                data.downcast_ref::<FileDrag>()
-                    .is_some_and(|d| d.owner == owner && d.side != side)
+                (side == FileSide::Remote && data.is::<ExternalPaths>())
+                    || data
+                        .downcast_ref::<FileDrag>()
+                        .is_some_and(|d| d.owner == owner && d.side != side)
             })
+            .drag_over::<ExternalPaths>(|style, _, _, cx| style.bg(cx.theme().accent))
+            .on_drop(cx.listener(move |this, paths: &ExternalPaths, window, cx| {
+                if side == FileSide::Remote {
+                    cx.stop_propagation();
+                    this.enqueue_external_upload(paths, external_directory.clone(), window, cx);
+                }
+            }))
             .drag_over::<FileDrag>(|style, _, _, cx| {
                 style
                     .bg(cx.theme().accent)

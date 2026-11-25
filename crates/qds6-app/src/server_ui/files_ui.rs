@@ -6,6 +6,8 @@ mod explorer;
 // 功能：隐藏本地时切换远程目录树与详情布局；时间：2026-11-12；作者：lq。
 mod remote_tree;
 use explorer::{local_owner, local_permissions};
+// 功能：接收 Finder 等系统文件管理器的原生路径负载；时间：2026-11-24；作者：lq。
+use gpui_kit::ExternalPaths;
 // 功能：真实 SFTP 隐藏目录和原生侧栏布局专项回归；时间：2026-11-11；作者：lq。
 #[cfg(feature = "ui-tests")]
 pub(super) mod smoke;
@@ -431,6 +433,45 @@ impl ServerWorkspace {
         self.enqueue_batch(side, entries, destination, window, cx);
     }
 
+    /// 功能：系统拖入路径直接进入上传队列，文件属性与递归预检留在后台；时间：2026-11-24；作者：lq。
+    fn enqueue_external_upload(
+        &mut self,
+        paths: &ExternalPaths,
+        directory: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.services.sftp.is_none() {
+            self.status = "SFTP 未连接".into();
+            self.error = true;
+        } else if !directory.is_absolute()
+            || paths.0.is_empty()
+            || paths
+                .0
+                .iter()
+                .any(|path| !path.is_absolute() || path.file_name().is_none())
+        {
+            self.status = "请选择普通文件或文件夹，并拖入有效的远程目录".into();
+            self.error = true;
+        } else if self.services.files.queue.len() + paths.0.len() > 20000 {
+            self.status = "批量传输超过队列容量（20000 项），请分批选择".into();
+            self.error = true;
+        } else {
+            for path in &paths.0 {
+                self.enqueue_request(
+                    TransferRequest {
+                        side: FileSide::Local,
+                        source: path.clone(),
+                        target: directory.join(path.file_name().unwrap()),
+                    },
+                    window,
+                    cx,
+                );
+            }
+        }
+        cx.notify();
+    }
+
     /// 功能：排队冻结路径，上传合并目录并覆盖同名文件，拒绝符号链接及重复任务；时间：2026-11-16；作者：lq。
     fn enqueue_transfer(
         &mut self,
@@ -451,11 +492,23 @@ impl ServerWorkspace {
             source: entry.path,
             target,
         };
+        self.enqueue_request(request, window, cx);
+    }
+
+    /// 功能：内部和系统拖入共用去重、容量限制及串行调度；时间：2026-11-24；作者：lq。
+    fn enqueue_request(
+        &mut self,
+        request: TransferRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let files = &mut self.services.files;
         if files.queue.len() >= 20000 {
             self.status = "传输队列已满（20000 项）".into();
         } else if files.active.iter().chain(files.queue.iter()).any(|item| {
-            item.side == side && item.source == request.source && item.target == request.target
+            item.side == request.side
+                && item.source == request.source
+                && item.target == request.target
         }) {
             self.status = "该传输已在队列中".into();
         } else {
@@ -568,6 +621,9 @@ impl ServerWorkspace {
         let files = self.directory_list(side, cx);
         let drop_view = cx.entity();
         let directory = browser.destination();
+        // 功能：分别冻结两类拖放的目标，目录切换不修改已排队任务；时间：2026-11-24；作者：lq。
+        let external_directory = directory.clone();
+        let external_view = cx.entity();
         let error = browser.errors.get(&browser.current).cloned();
         v_flex()
             .id(if side == FileSide::Local {
@@ -726,8 +782,25 @@ impl ServerWorkspace {
                     .min_h_0()
                     .w_full()
                     .can_drop(move |data, _, _| {
-                        data.downcast_ref::<FileDrag>()
-                            .is_some_and(|drag| drag.owner == owner && drag.side != side)
+                        (side == FileSide::Remote && data.is::<ExternalPaths>())
+                            || data
+                                .downcast_ref::<FileDrag>()
+                                .is_some_and(|drag| drag.owner == owner && drag.side != side)
+                    })
+                    // 功能：系统拖入远程区时显示落点反馈，并复用原有上传进度与错误提示；时间：2026-11-24；作者：lq。
+                    .drag_over::<ExternalPaths>(|style, _, _, cx| style.bg(cx.theme().accent))
+                    .on_drop(move |paths: &ExternalPaths, window, cx| {
+                        if side == FileSide::Remote {
+                            cx.stop_propagation();
+                            external_view.update(cx, |this, cx| {
+                                this.enqueue_external_upload(
+                                    paths,
+                                    external_directory.clone(),
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }
                     })
                     .drag_over::<FileDrag>(|style, _, _, cx| style.bg(cx.theme().accent))
                     .on_drop(move |drag: &FileDrag, window, cx| {

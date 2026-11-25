@@ -439,6 +439,16 @@ pub fn run_sidebar_files_smoke() {
         &root,
         &remote_root,
     );
+    // 功能：覆盖原先遗漏的系统外部路径事件和真实上传；时间：2026-11-24；作者：lq。
+    verify_external_upload(
+        &mut cx,
+        handle,
+        &view,
+        &server,
+        &client,
+        &root,
+        &remote_root,
+    );
     cx.update_window(handle, |_, window, _| window.remove_window())
         .unwrap();
     drop(cx);
@@ -1248,4 +1258,174 @@ fn verify_file_scrolling(
     println!(
         "PASS file scrolling: 80 real local/remote files, vertical line/pixel wheel, end-of-list, both scrollbar thumb drags, 1440/960 dual-list and remote-tree modes"
     );
+}
+
+/// 功能：使用平台文件拖放事件验收外部多文件、子目录、覆盖及失败反馈；时间：2026-11-24；作者：lq。
+fn verify_external_upload(
+    cx: &mut HeadlessAppContext,
+    handle: AnyWindowHandle,
+    view: &Entity<Workbench>,
+    server: &Entity<ServerWorkspace>,
+    client: &sftp::Client,
+    root: &Path,
+    remote_root: &Path,
+) {
+    let local = root.join("Finder 外部文件");
+    let remote = remote_root.join("external-drop");
+    std::fs::create_dir_all(local.join("文件夹/empty")).unwrap();
+    std::fs::write(local.join("中文 file.txt"), "external original").unwrap();
+    std::fs::write(local.join("文件夹/nested.txt"), "nested external").unwrap();
+    client.mkdir(&remote).unwrap();
+    client.mkdir(&remote.join("child")).unwrap();
+    cx.update_window(handle, |_, window, cx| {
+        server.update(cx, |state, cx| {
+            state.services.files.show_local = true;
+            state.navigate_directory(FileSide::Remote, remote.clone(), window, cx);
+        });
+    })
+    .unwrap();
+    settle(cx, handle, view);
+    // 功能：本地面板不接收外部上传；远端空白区多项上传沿用同名覆盖及目录合并；时间：2026-11-24；作者：lq。
+    for (target, text) in [
+        ("local-files-drop", "ignored"),
+        ("remote-files-drop", "external original"),
+        ("remote-files-drop", "replacement"),
+    ] {
+        std::fs::write(local.join("中文 file.txt"), text).unwrap();
+        cx.update_window(handle, |_, window, cx| {
+            let bounds = window.find(target).bounds();
+            let position = point(bounds.center().x, bounds.bottom() - px(8.));
+            dispatch_external_drop(
+                window,
+                cx,
+                position,
+                vec![local.join("中文 file.txt"), local.join("文件夹")],
+            );
+        })
+        .unwrap();
+        settle(cx, handle, view);
+        if target == "local-files-drop" {
+            assert!(
+                client
+                    .list(&remote)
+                    .unwrap()
+                    .iter()
+                    .all(|e| e.name == "child")
+            );
+        } else {
+            assert_eq!(
+                client
+                    .open_document(&remote.join("中文 file.txt"))
+                    .unwrap()
+                    .text,
+                text
+            );
+            assert_eq!(
+                client
+                    .open_document(&remote.join("文件夹/nested.txt"))
+                    .unwrap()
+                    .text,
+                "nested external"
+            );
+            assert!(
+                client
+                    .list(&remote.join("文件夹/empty"))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+    // 功能：落在子目录行仅传到子目录，禁止冒泡重复传到父目录；时间：2026-11-24；作者：lq。
+    std::fs::write(local.join("child-only.txt"), "child target").unwrap();
+    cx.update_window(handle, |_, window, cx| {
+        let row = server.read(cx).file_row(true, &remote.join("child"), cx);
+        let position = window.find(row).bounds().center();
+        dispatch_external_drop(window, cx, position, vec![local.join("child-only.txt")]);
+    })
+    .unwrap();
+    settle(cx, handle, view);
+    assert_eq!(
+        client
+            .open_document(&remote.join("child/child-only.txt"))
+            .unwrap()
+            .text,
+        "child target"
+    );
+    assert!(
+        client
+            .open_document(&remote.join("child-only.txt"))
+            .is_err()
+    );
+    // 功能：隐藏本地布局仍接受外部拖入，源已删除时显示后台传输失败；时间：2026-11-24；作者：lq。
+    cx.update_window(handle, |_, window, cx| {
+        server.update(cx, |state, cx| {
+            state.services.files.show_local = false;
+            state.sync_remote_tree(window, cx);
+            cx.notify();
+        });
+    })
+    .unwrap();
+    settle(cx, handle, view);
+    // 功能：远程树节点也是独立落点，上传后不跳转当前目录；时间：2026-11-24；作者：lq。
+    std::fs::write(local.join("tree-only.txt"), "tree target").unwrap();
+    let row = reveal_remote_tree_row(cx, handle, view, server, &remote.join("child"));
+    cx.update_window(handle, |_, window, cx| {
+        let position = window.find(("remote-directory", row)).bounds().center();
+        dispatch_external_drop(window, cx, position, vec![local.join("tree-only.txt")]);
+    })
+    .unwrap();
+    settle(cx, handle, view);
+    assert_eq!(
+        client
+            .open_document(&remote.join("child/tree-only.txt"))
+            .unwrap()
+            .text,
+        "tree target"
+    );
+    assert!(client.open_document(&remote.join("tree-only.txt")).is_err());
+    cx.update(|cx| assert_eq!(server.read(cx).services.files.remote.current, remote));
+    cx.update_window(handle, |_, window, cx| {
+        let bounds = window.find("remote-files-drop").bounds();
+        let position = point(bounds.right() - px(30.), bounds.bottom() - px(8.));
+        dispatch_external_drop(window, cx, position, vec![local.join("missing.txt")]);
+    })
+    .unwrap();
+    settle(cx, handle, view);
+    cx.update(|cx| {
+        let state = server.read(cx);
+        assert!(state.error);
+        assert!(
+            state
+                .services
+                .files
+                .history
+                .front()
+                .unwrap()
+                .contains("失败")
+        );
+        assert!(state.services.files.queue.is_empty());
+    });
+    println!(
+        "PASS external platform file drop: local rejection, remote multi-file and recursive upload, Unicode, overwrite, child and tree targets without bubbling, hidden-local mode and missing-source feedback"
+    );
+}
+
+/// 功能：走 GPUI 对 macOS 系统拖入所用的 Entered/Pending/Submit 路径；时间：2026-11-24；作者：lq。
+fn dispatch_external_drop(
+    window: &mut Window,
+    cx: &mut App,
+    position: Point<Pixels>,
+    paths: Vec<PathBuf>,
+) {
+    window.dispatch_event(
+        FileDropEvent::Entered {
+            position,
+            paths: ExternalPaths(paths.into_iter().collect()),
+        }
+        .to_platform_input(),
+        cx,
+    );
+    window.dispatch_event(FileDropEvent::Pending { position }.to_platform_input(), cx);
+    window.dispatch_event(FileDropEvent::Submit { position }.to_platform_input(), cx);
+    window.dispatch_event(FileDropEvent::Ended.to_platform_input(), cx);
 }
