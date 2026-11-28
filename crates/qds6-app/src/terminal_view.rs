@@ -2,8 +2,10 @@
 
 use gpui_kit::{
     component::{
+        Disableable, Sizable,
+        button::{Button, ButtonVariants},
         h_flex,
-        input::{Input, InputState},
+        input::{Input, InputEvent as SearchInputEvent, InputState},
         v_flex,
     },
     *,
@@ -37,6 +39,9 @@ pub struct TerminalView {
     search: Entity<InputState>,
     // 功能：终端搜索按需显示，默认把空间留给命令输出；时间：2026-11-11；作者：lq。
     show_search: bool,
+    // 功能：搜索任务独立于 SSH 输入与渲染，状态只显示在搜索条；时间：2026-11-27；作者：lq。
+    search_task: Option<Task<()>>,
+    search_status: &'static str,
     _search_subscription: Subscription,
 }
 
@@ -72,6 +77,51 @@ impl TerminalView {
         }
         cx.notify();
     }
+
+    /// 功能：后台查找滚屏文字，避免较长历史的扫描阻塞界面；时间：2026-11-27；作者：lq。
+    fn find_output(&mut self, previous: bool, cx: &mut Context<Self>) {
+        let query = self.search.read(cx).value().to_string();
+        if self.search_task.is_some() || query.is_empty() {
+            return;
+        }
+        self.search_status = "正在搜索…";
+        let model = self.session.model.clone();
+        self.search_task = Some(cx.spawn(async move |view, cx| {
+            let requested = query.clone();
+            let found = cx
+                .background_spawn(async move {
+                    model
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .find_output(&requested, previous)
+                })
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                this.search_task = None;
+                if this.show_search && this.search.read(cx).value().as_str() == query {
+                    this.search_status = if found { "已定位" } else { "无匹配" };
+                } else {
+                    this.session
+                        .model
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clear_search();
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
+    /// 功能：让文件管理器读取同一终端的当前目录或将焦点交还给终端；时间：2026-11-27；作者：lq。
+    pub(super) fn reported_directory(&self) -> Option<String> {
+        self.session
+            .model
+            .try_lock()
+            .ok()?
+            .reported_directory()
+            .map(str::to_owned)
+    }
     /// 功能：验收读取可见终端文本，不进入发行 API；时间：2026-11-10；作者：lq。
     #[cfg(feature = "ui-tests")]
     pub(crate) fn screen_text(&self) -> String {
@@ -88,18 +138,49 @@ impl TerminalView {
     }
     /// 功能：批次刷新终端，UI 不执行网络操作；时间：2026-11-10；作者：lq。
     pub fn new(session: TerminalSession, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // 功能：仅在收到输出或后台状态变化后请求重绘；时间：2026-11-27；作者：lq。
+        let model = session.model.clone();
         let refresh = cx.spawn(async move |this, cx| {
+            let mut revision = 0;
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(33))
                     .await;
-                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                let Ok(terminal) = model.try_lock() else {
+                    continue;
+                };
+                let changed = terminal.revision();
+                drop(terminal);
+                if this
+                    .update(cx, |_, cx| {
+                        if changed != revision {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
                     break;
                 }
+                revision = changed;
             }
         });
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索当前屏幕"));
-        let subscription = cx.observe(&search, |_, _, cx| cx.notify());
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索终端输出和历史"));
+        let subscription = cx.subscribe(
+            &search,
+            |this, _, event: &SearchInputEvent, cx| match event {
+                SearchInputEvent::Change => {
+                    this.search_status = "";
+                    if let Ok(mut model) = this.session.model.try_lock() {
+                        model.clear_search();
+                    }
+                    cx.notify();
+                }
+                SearchInputEvent::PressEnter { secondary, shift } => {
+                    this.find_output(*shift || *secondary, cx);
+                }
+                _ => {}
+            },
+        );
         Self {
             session,
             focus: cx.focus_handle(),
@@ -115,6 +196,8 @@ impl TerminalView {
             _refresh: refresh,
             search,
             show_search: false,
+            search_task: None,
+            search_status: "",
             _search_subscription: subscription,
         }
     }
@@ -311,7 +394,7 @@ impl Render for TerminalView {
             })
             .unwrap_or((0, 0));
         let preedit = self.preedit.clone();
-        let search = self.search.read(cx).value().to_lowercase();
+        let show_search = self.show_search;
         let palette = self.theme.palette();
         v_flex()
             .size_full()
@@ -423,21 +506,6 @@ impl Render for TerminalView {
                                         let cell_width = font_size * 0.6;
                                         let cell_height = font_size * 1.4;
                                         for (row, cells) in frame.rows.iter().enumerate() {
-                                            let line_text = cells
-                                                .iter()
-                                                .filter(|c| !c.spacer)
-                                                .map(|c| c.text.as_str())
-                                                .collect::<String>()
-                                                .to_lowercase();
-                                            let matches: Vec<_> = if search.is_empty() {
-                                                Vec::new()
-                                            } else {
-                                                line_text
-                                                    .match_indices(search.as_str())
-                                                    .map(|(start, text)| start..start + text.len())
-                                                    .collect()
-                                            };
-                                            let mut text_offset = 0;
                                             for (column, cell) in cells.iter().enumerate() {
                                                 if cell.spacer {
                                                     continue;
@@ -451,25 +519,30 @@ impl Render for TerminalView {
                                                     px(cell_width
                                                         * if cell.wide { 2. } else { 1. });
                                                 // 功能：搜索高亮和光标同步适配浅深色，显式真彩色仍由网格保留；时间：2026-11-11；作者：lq。
-                                                let matched = matches
-                                                    .iter()
-                                                    .any(|range| range.contains(&text_offset));
-                                                window.paint_quad(fill(
-                                                    Bounds {
-                                                        origin,
-                                                        size: size(width, px(cell_height)),
-                                                    },
-                                                    // 功能：选区高亮优先于搜索及光标，颜色随终端主题变化；时间：2026-11-16；作者：lq。
-                                                    rgb(if cell.selected {
-                                                        palette.cursor
-                                                    } else if matched {
-                                                        palette.search_background
-                                                    } else if cell.cursor {
-                                                        palette.cursor
-                                                    } else {
-                                                        cell.background
-                                                    }),
-                                                ));
+                                                let matched = show_search && cell.search_match;
+                                                // 功能：沿用面板底色，只有不同背景、光标或高亮才发出绘制单元；时间：2026-11-27；作者：lq。
+                                                let background = if cell.selected {
+                                                    palette.cursor
+                                                } else if matched {
+                                                    palette.search_background
+                                                } else if cell.cursor {
+                                                    palette.cursor
+                                                } else {
+                                                    cell.background
+                                                };
+                                                if background != palette.background {
+                                                    window.paint_quad(fill(
+                                                        Bounds {
+                                                            origin,
+                                                            size: size(width, px(cell_height)),
+                                                        },
+                                                        rgb(background),
+                                                    ));
+                                                }
+                                                // 功能：空白单元格仅画背景，跳过无可见字形的布局；时间：2026-11-27；作者：lq。
+                                                if cell.text == " " {
+                                                    continue;
+                                                }
                                                 let font = font("Menlo");
                                                 let run = TextRun {
                                                     len: cell.text.len(),
@@ -494,7 +567,6 @@ impl Render for TerminalView {
                                                     &[run],
                                                     None,
                                                 );
-                                                text_offset += cell.text.to_lowercase().len();
                                                 let _ = line.paint(
                                                     origin,
                                                     px(cell_height),
@@ -540,7 +612,41 @@ impl Render for TerminalView {
                     ),
             )
             .when(self.show_search, |v| {
-                v.child(Input::new(&self.search).aria_label("终端搜索"))
+                v.child(
+                    h_flex()
+                        .px_2()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex_1()
+                                .child(Input::new(&self.search).aria_label("终端搜索")),
+                        )
+                        .child(div().text_xs().child(self.search_status))
+                        .children(
+                            [(true, "上一个"), (false, "下一个")].map(|(previous, label)| {
+                                Button::new(label)
+                                    .ghost()
+                                    .xsmall()
+                                    .label(label)
+                                    .disabled(
+                                        self.search_task.is_some()
+                                            || self.search.read(cx).value().is_empty(),
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.find_output(previous, cx)
+                                    }))
+                            }),
+                        )
+                        .child(
+                            Button::new("close-terminal-search")
+                                .ghost()
+                                .xsmall()
+                                .label("关闭")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_search(window, cx)
+                                })),
+                        ),
+                )
             })
             .child(h_flex().px_3().py_1().text_xs().child(format!(
                 "{status} · {}×{} · 拖选文字后 ⌘C 复制 / ⌘⇧C 复制屏幕 / ⌘V 粘贴 / ⌘± 缩放",

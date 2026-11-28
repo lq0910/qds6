@@ -33,6 +33,9 @@ impl CredentialStore {
         if let Some(key) = FIXTURE_DRAFT_KEY.get() {
             return Ok(Zeroizing::new(key.to_vec()));
         }
+        // 功能：串行获取或初始化远程草稿与 SQL 共用的加密密钥；时间：2026-11-27；作者：lq。
+        static KEY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = KEY_LOCK.lock().map_err(|_| "草稿密钥状态异常")?;
         use base64::Engine;
         use rand::RngCore;
         let id = CredentialRef(uuid::Uuid::from_u128(0x71647336000040008000000000000001));

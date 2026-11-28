@@ -5,10 +5,17 @@ use alacritty_terminal::{
     event::{Event, EventListener},
     grid::{Dimensions, Scroll},
     // 功能：复用终端原生选区以正确处理回滚、软换行和宽字符；时间：2026-11-16；作者：lq。
-    index::{Column, Line, Point, Side},
+    index::{Boundary, Column, Direction, Line, Point, Side},
     selection::{Selection, SelectionType},
-    term::{Config, TermMode, cell::Flags},
-    vte::ansi::{Color, NamedColor, Processor},
+    term::{
+        Config, TermMode,
+        cell::Flags,
+        search::{Match, RegexSearch},
+    },
+    vte::{
+        Parser, Perform,
+        ansi::{Color, NamedColor, Processor},
+    },
 };
 use qds6_core::{TerminalPalette, TerminalTheme};
 use std::{
@@ -57,6 +64,8 @@ pub struct Cell {
     pub cursor: bool,
     // 功能：将原生选区映射到绘制快照；时间：2026-11-16；作者：lq。
     pub selected: bool,
+    // 功能：在网格坐标中高亮当前滚屏搜索结果；时间：2026-11-27；作者：lq。
+    pub search_match: bool,
 }
 
 /// 功能：UI 快照在锁外绘制，网络 worker 不进入 GPUI；时间：2026-11-10；作者：lq。
@@ -74,6 +83,39 @@ pub struct Model {
     pub status: String,
     // 功能：配色只影响快照映射，保留 VT 网格、历史和真彩色；时间：2026-11-11；作者：lq。
     theme: TerminalTheme,
+    // 功能：按输出代次更新视图并跟踪搜索、远端目录；时间：2026-11-27；作者：lq。
+    revision: u64,
+    search: Option<(String, u64, Match)>,
+    directory_parser: Parser,
+    directory: ReportedDirectory,
+}
+
+/// 功能：读取 Shell 上报的 OSC 7 路径，仅作为当前 SSH 会话的文件导航目标；时间：2026-11-27；作者：lq。
+#[derive(Default)]
+struct ReportedDirectory(Option<String>);
+
+impl Perform for ReportedDirectory {
+    fn osc_dispatch(&mut self, fields: &[&[u8]], _: bool) {
+        let [b"7", value] = fields else { return };
+        self.0 = (|| {
+            let value = value.strip_prefix(b"file://")?;
+            let path = &value[value.iter().position(|&byte| byte == b'/')?..];
+            let mut decoded = Vec::with_capacity(path.len());
+            let mut remaining = path;
+            while let Some((&byte, tail)) = remaining.split_first() {
+                if byte == b'%' {
+                    let hex = std::str::from_utf8(tail.get(..2)?).ok()?;
+                    decoded.push(u8::from_str_radix(hex, 16).ok()?);
+                    remaining = &tail[2..];
+                } else {
+                    decoded.push(byte);
+                    remaining = tail;
+                }
+            }
+            let path = String::from_utf8(decoded).ok()?;
+            (!path.contains(char::is_control)).then_some(path)
+        })();
+    }
 }
 
 /// 功能：与 UI 无关的有效终端尺寸；时间：2026-11-10；作者：lq。
@@ -115,12 +157,82 @@ impl Model {
             responses,
             status: "已连接".into(),
             theme: TerminalTheme::default(),
+            revision: 0,
+            search: None,
+            directory_parser: Parser::new(),
+            directory: ReportedDirectory::default(),
         }
     }
 
     /// 功能：按字节批次推进 VT 状态机；时间：2026-11-10；作者：lq。
     pub fn feed(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
+        self.directory_parser.advance(&mut self.directory, bytes);
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// 功能：检测后台输出、状态和尺寸变化，空闲时跳过网格重绘；时间：2026-11-27；作者：lq。
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// 功能：提供 Shell 最近上报的有效绝对目录；时间：2026-11-27；作者：lq。
+    pub fn reported_directory(&self) -> Option<&str> {
+        self.directory.0.as_deref()
+    }
+
+    /// 功能：按字面查找整个终端缓冲、循环定位并按真实网格坐标高亮；时间：2026-11-27；作者：lq。
+    pub fn find_output(&mut self, query: &str, previous: bool) -> bool {
+        self.search = self
+            .search
+            .take()
+            .filter(|(text, revision, _)| text == query && *revision == self.revision);
+        if query.is_empty() || query.chars().count() > 256 {
+            return false;
+        }
+        let mut pattern = String::from("(?i)");
+        for ch in query.chars() {
+            if "\\.^$|?*+()[]{}".contains(ch) {
+                pattern.push('\\');
+            }
+            pattern.push(ch);
+        }
+        let Ok(mut regex) = RegexSearch::new(&pattern) else {
+            return false;
+        };
+        let (origin, direction, side) = if previous {
+            let origin = self.search.as_ref().map_or_else(
+                || self.selection_point(self.term.screen_lines() - 1, self.term.columns() - 1),
+                |(_, _, range)| range.start().sub(&self.term, Boundary::None, 1),
+            );
+            (origin, Direction::Left, Side::Right)
+        } else {
+            let origin = self.search.as_ref().map_or_else(
+                || self.selection_point(0, 0),
+                |(_, _, range)| range.end().add(&self.term, Boundary::None, 1),
+            );
+            (origin, Direction::Right, Side::Left)
+        };
+        let Some(found) = self
+            .term
+            .search_next(&mut regex, origin, direction, side, None)
+        else {
+            return false;
+        };
+        self.term.scroll_to_point(*found.start());
+        self.search = Some((query.to_owned(), self.revision, found));
+        true
+    }
+
+    /// 功能：关闭或修改搜索时移除旧高亮；时间：2026-11-27；作者：lq。
+    pub fn clear_search(&mut self) {
+        self.search = None;
+    }
+
+    /// 功能：后台终端状态变化也能唤醒空闲视图；时间：2026-11-27；作者：lq。
+    fn set_status(&mut self, status: &str) {
+        self.status = status.into();
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// 功能：切换主题重新映射现有网格，不清屏、不重连、不改服务端颜色；时间：2026-11-11；作者：lq。
@@ -134,6 +246,7 @@ impl Model {
             columns: columns.clamp(20, 300) as usize,
             rows: rows.clamp(5, 120) as usize,
         });
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// 功能：有界回滚滚动，输出不复制到无界文本缓冲；时间：2026-11-10；作者：lq。
@@ -249,6 +362,9 @@ impl Model {
                         || (source.flags.contains(Flags::WIDE_CHAR)
                             && selection
                                 .contains(Point::new(indexed.point.line, indexed.point.column + 1)))
+                }),
+                search_match: self.search.as_ref().is_some_and(|(_, revision, range)| {
+                    *revision == self.revision && range.contains(&indexed.point)
                 }),
             });
         }
@@ -384,7 +500,7 @@ impl TerminalSession {
                             worker_model
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
-                                .status = "PTY 尺寸更新失败".into();
+                                .set_status("PTY 尺寸更新失败");
                             pending_resize = None;
                         }
                     }
@@ -432,7 +548,7 @@ impl TerminalSession {
             worker_model
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .status = outcome.into();
+                .set_status(outcome);
         });
         Ok(Self {
             model,
@@ -493,6 +609,46 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 功能：验证超出屏幕的字面结果可循环定位，中文及正则字符保持原义；时间：2026-11-27；作者：lq。
+    #[test]
+    fn terminal_search_finds_and_navigates_scrollback() {
+        let mut model = Model::new(40, 5);
+        model.feed(
+            "ERROR[1] 中文\r\nline1\r\nline2\r\nline3\r\nline4\r\nline5\r\nerror[1] current"
+                .as_bytes(),
+        );
+        assert!(model.find_output("error[1]", false));
+        let recent = *model.search.as_ref().unwrap().2.start();
+        assert!(recent.line.0 >= 0);
+        assert!(model.find_output("error[1]", false));
+        let older = *model.search.as_ref().unwrap().2.start();
+        assert!(older.line.0 < 0);
+        assert!(
+            model
+                .frame()
+                .rows
+                .iter()
+                .flatten()
+                .any(|cell| cell.search_match)
+        );
+        assert!(model.find_output("error[1]", true));
+        assert_eq!(*model.search.as_ref().unwrap().2.start(), recent);
+        assert!(model.find_output("中文", true));
+        assert!(!model.find_output("unmatched", false));
+    }
+
+    /// 功能：覆盖跨读取分片的 OSC 7、安全的路径解码和非法控制符拒绝；时间：2026-11-27；作者：lq。
+    #[test]
+    fn reports_only_valid_osc_directories() {
+        let mut model = Model::new(40, 5);
+        model.feed(b"\x1b]7;file://server/srv/app%20");
+        assert!(model.reported_directory().is_none());
+        model.feed(b"%E4%B8%AD\x1b\\");
+        assert_eq!(model.reported_directory(), Some("/srv/app 中"));
+        model.feed(b"\x1b]7;file://server/srv/invalid%0Apath\x07");
+        assert!(model.reported_directory().is_none());
+    }
     /// 功能：验证局部、反向、多行选区及单击清空，避免复制整屏回归；时间：2026-11-16；作者：lq。
     #[test]
     fn output_selection_copies_only_selected_cells_in_both_directions() {

@@ -9,6 +9,8 @@ use zeroize::Zeroizing;
 
 // 功能：将旧密码格式兼容限制在独立模块，业务导入只接收临时凭据；时间：2026-11-11；作者：lq。
 mod passwords;
+// 功能：静态预览 OpenSSH 配置中的常用连接字段；时间：2026-11-27；作者：lq。
+mod openssh;
 
 /// 功能：明确用户选择的来源，不根据扩展名猜测加密格式；时间：2026-11-10；作者：lq。
 #[derive(Clone, Copy)]
@@ -17,6 +19,8 @@ pub enum Source {
     FinalShell,
     FileZilla,
     Navicat,
+    // 功能：在现有导入向导中显式选择 OpenSSH；时间：2026-11-27；作者：lq。
+    OpenSsh,
 }
 
 /// 功能：解析结果与待补全报告先展示，确认前绝不写入数据库；时间：2026-11-10；作者：lq。
@@ -89,6 +93,9 @@ pub fn preview(source: Source, bytes: &[u8]) -> Result<Preview, String> {
             .to_string()
     };
     let notice = match source {
+        Source::OpenSsh => {
+            "导入具体 Host 别名、用户、主机、端口、私钥路径和可解析的单跳别名；请核对预览中的地址和认证方式。"
+        }
         Source::FinalShell | Source::Navicat => {
             "已识别的保存密码将随账号一并迁移，确认后写入系统凭据库；无法识别的密码需补填，私钥文件需重新选择。仅支持已验证字段和密码格式。"
         }
@@ -105,6 +112,7 @@ pub fn preview(source: Source, bytes: &[u8]) -> Result<Preview, String> {
         Source::FinalShell => final_shell(&text, &mut result)?,
         Source::FileZilla => xml_import(&text, false, &mut result)?,
         Source::Navicat => xml_import(&text, true, &mut result)?,
+        Source::OpenSsh => openssh::parse(&text, &mut result)?,
     }
     if result.config.profiles.is_empty() {
         // 功能：无可导入项时仍展示跳过原因，不把兼容报告藏在成功预览之后；时间：2026-11-11；作者：lq。

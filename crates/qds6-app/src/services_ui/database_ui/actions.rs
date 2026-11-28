@@ -211,11 +211,25 @@ impl Workbench {
                     })
                 }),
         );
-        menu.separator().item(
-            PopupMenuItem::new("刷新")
-                .disabled(busy)
-                .on_click(move |_, w, cx| view.update(cx, |this, cx| this.load_tables(w, cx))),
-        )
+        // 功能：左右对象目录共用关系图入口，绑定右键所命中的基础表；时间：2026-11-28；作者：lq。
+        let refresh_view = view.clone();
+        menu.separator()
+            .item(
+                PopupMenuItem::new("刷新")
+                    .disabled(busy)
+                    .on_click(move |_, w, cx| {
+                        refresh_view.update(cx, |this, cx| this.load_tables(w, cx))
+                    }),
+            )
+            .item(
+                PopupMenuItem::new("查看关系图")
+                    .disabled(busy || table.kind != "BASE TABLE")
+                    .on_click(move |_, w, cx| {
+                        view.update(cx, |this, cx| {
+                            this.open_relationship_graph(table.clone(), w, cx)
+                        })
+                    }),
+            )
     }
     /// 功能：活动数据库连接的侧栏菜单也提供整库入口，禁止对未连接或其他连接误执行；时间：2026-11-12；作者：lq。
     pub(crate) fn connected_database_menu(

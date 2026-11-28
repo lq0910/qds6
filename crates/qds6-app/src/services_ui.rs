@@ -163,7 +163,7 @@ pub(super) struct ServiceUi {
     // 功能：查询栏展示服务端实际数据库及当前模式；时间：2026-11-11；作者：lq。
     database_context: (String, String),
     // 功能：数据库上下文独立于服务器连接表单；时间：2026-11-11；作者：lq。
-    database_profile: Option<ConnectionProfile>,
+    pub(super) database_profile: Option<ConnectionProfile>,
     results: Option<QueryResult>,
     grid: Option<Entity<TableState<QueryRows>>>,
     selected_result: usize,
@@ -528,6 +528,15 @@ impl Workbench {
                 return;
             }
         };
+        // 功能：书签仅对同一连接有效，切换到其他连接不沿用旧目录；时间：2026-11-27；作者：lq。
+        if self
+            .local_tools
+            .pending_directory
+            .as_ref()
+            .is_some_and(|entry| entry.connection != profile.id)
+        {
+            self.local_tools.pending_directory = None;
+        }
         // 功能：同数据库复用会话，切换数据库前要求关闭旧连接以保护事务和草稿；时间：2026-11-11；作者：lq。
         if matches!(profile.protocol, Protocol::MySql | Protocol::PostgreSql)
             && self.services.database.is_some()
@@ -539,6 +548,7 @@ impl Workbench {
                 .is_some_and(|p| p == &profile)
             {
                 self.activate_workspace(workspace_ui::WorkspaceTarget::Database, cx);
+                self.remember_connection(profile.id, cx);
             } else {
                 self.status = "请先关闭当前数据库连接，再连接其他数据库".into();
                 cx.notify();
@@ -554,6 +564,7 @@ impl Workbench {
                 .position(|server| server.read(cx).profile.id == profile.id)
         {
             self.activate_workspace(workspace_ui::WorkspaceTarget::Server(index), cx);
+            self.remember_connection(profile.id, cx);
             return;
         }
         if matches!(profile.protocol, Protocol::Ssh | Protocol::Sftp)
@@ -605,13 +616,13 @@ impl Workbench {
                         Err(SshError::UnknownHost { fingerprint }) => {
                             return Ok(Connected::Trust(jump, fingerprint, known));
                         }
-                        Err(error) => return Err(error.to_string()),
+                        // 功能：连接错误区分目标主机与跳板的故障阶段；时间：2026-11-27；作者：lq。
+                        Err(error) => return Err(format!("跳板 {} · {error}", jump.name)),
                     };
-                    Some(Arc::new(ssh::TunnelLease::start(
-                        session,
-                        profile.host.clone(),
-                        profile.port,
-                    )?))
+                    Some(Arc::new(
+                        ssh::TunnelLease::start(session, profile.host.clone(), profile.port)
+                            .map_err(|error| format!("跳板转发 · {error}"))?,
+                    ))
                 } else {
                     None
                 };
@@ -632,7 +643,7 @@ impl Workbench {
                             Err(SshError::UnknownHost { fingerprint }) => {
                                 return Ok(Connected::Trust(profile, fingerprint, known));
                             }
-                            Err(error) => return Err(error.to_string()),
+                            Err(error) => return Err(format!("目标 {} · {error}", profile.name)),
                         };
                         let (terminal, client, mut error) = if profile.protocol == Protocol::Ssh {
                             let terminal = TerminalSession::start(session, 100, 30)?
@@ -684,6 +695,7 @@ impl Workbench {
                     }
 
                     _ => DatabaseSession::connect(&profile, &secret, tunnel)
+                        .map_err(|error| format!("数据库 {} · {error}", profile.name))
                         .map(|database| Connected::Database(database, profile)),
                 }
             },
@@ -696,6 +708,8 @@ impl Workbench {
                     error,
                     monitor,
                 } => {
+                    let connected_id = profile.id;
+                    let bookmark = this.local_tools.pending_directory.take();
                     let storage = this.storage_path.clone();
                     let server = cx.new(|cx| {
                         crate::server_ui::ServerWorkspace::new(
@@ -705,7 +719,13 @@ impl Workbench {
                     server.update(cx, |server, cx| {
                         server.attach_monitor(monitor, cx);
                         server.initialize(draft, error, window, cx);
+                        if let Some(bookmark) =
+                            bookmark.filter(|entry| entry.connection == connected_id)
+                        {
+                            server.open_bookmark(bookmark.path.into(), window, cx);
+                        }
                     });
+                    this.remember_connection(connected_id, cx);
                     // 功能：新连接继承保存的终端字号；时间：2026-11-11；作者：lq。
                     if let Some(terminal) = server.read(cx).terminal.clone() {
                         terminal.update(cx, |terminal, cx| {
@@ -728,6 +748,7 @@ impl Workbench {
                     this.status = "服务器已连接 · 上方终端，下方本地与远程文件".into();
                 }
                 Connected::Database(database, profile) => {
+                    this.remember_connection(profile.id, cx);
                     this.services.transfer = None;
                     this.services.table_properties.clear();
                     this.services.database_profile = Some(profile);
@@ -790,6 +811,10 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 功能：只记录通过运行入口并成功进入执行流程的 SQL 尝试；时间：2026-11-27；作者：lq。
+        if self.services.busy || self.groups.busy {
+            return;
+        }
         let Some(database) = self.services.database.clone() else {
             self.status = "请先连接 MySQL 或 PostgreSQL".into();
             cx.notify();
@@ -804,6 +829,7 @@ impl Workbench {
                 text.get(range).unwrap_or(&text).to_string()
             }
         });
+        self.remember_sql(&sql, cx);
         // 功能：结构操作完成后刷新对象列表，查询文本仍保持原样执行；时间：2026-11-11；作者：lq。
         let refresh_objects = sql.split(|c: char| !c.is_ascii_alphabetic()).any(|word| {
             ["CREATE", "ALTER", "DROP", "TRUNCATE"]

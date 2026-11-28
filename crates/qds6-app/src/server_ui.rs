@@ -59,6 +59,47 @@ pub(super) struct ServerFiles {
 }
 
 impl ServerWorkspace {
+    /// 功能：持久化已经定位的远程绝对目录，跳过未加载的起始路径；时间：2026-11-27；作者：lq。
+    pub(super) fn remote_bookmark_path(&self) -> Option<String> {
+        self.services.sftp.as_ref()?;
+        self.services
+            .files
+            .remote
+            .loaded_directory()
+            .map(str::to_owned)
+    }
+
+    /// 功能：打开书签时显示文件区，编辑草稿仍保留在会话；时间：2026-11-27；作者：lq。
+    pub(super) fn open_bookmark(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.files_visible = true;
+        self.services.page = 1;
+        self.open_remote_directory(path, window, cx);
+    }
+
+    /// 功能：从同一 SSH 终端跳到已上报的目录，复用 SFTP 导航与错误反馈；时间：2026-11-27；作者：lq。
+    fn show_terminal_directory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self
+            .terminal
+            .as_ref()
+            .and_then(|view| view.read(cx).reported_directory())
+        else {
+            self.status =
+                "当前 Shell 未上报目录（OSC 7）；可在终端执行 pwd 后将路径填入远程地址栏".into();
+            self.files_visible = true;
+            self.services.page = 1;
+            cx.notify();
+            return;
+        };
+        self.files_visible = true;
+        self.services.page = 1;
+        self.open_remote_directory(path.into(), window, cx);
+    }
+
     /// 功能：接收后台认证结果，建立独立文件视图并在后台读取初始目录；时间：2026-11-11；作者：lq。
     pub(super) fn new(
         profile: ConnectionProfile,
@@ -623,6 +664,21 @@ impl Render for ServerWorkspace {
                                 }),
                         )
                     })
+                    .when(
+                        self.terminal.is_some() && self.services.sftp.is_some(),
+                        |v| {
+                            v.child(
+                                Button::new("show-terminal-directory")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(UiIcon::FolderOpen)
+                                    .tooltip("在文件区打开终端当前目录（需要 Shell 支持 OSC 7）")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.show_terminal_directory(window, cx)
+                                    })),
+                            )
+                        },
+                    )
                     .child(
                         Button::new("toggle-server-files")
                             .ghost()

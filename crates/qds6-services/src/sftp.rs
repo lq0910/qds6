@@ -52,6 +52,8 @@ pub struct Transfer {
     pub cancel: Arc<AtomicBool>,
     pub completed: Arc<AtomicU64>,
     pub total: Arc<AtomicU64>,
+    // 功能：合并上传逐文件记录已发布相对路径，重试只处理余项；时间：2026-11-27；作者：lq。
+    pub published: Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>,
 }
 
 impl Transfer {
@@ -404,7 +406,9 @@ impl Client {
             progress.total.store(metadata.len(), Ordering::Relaxed);
             progress.completed.store(0, Ordering::Relaxed);
         }
-        self.upload_file_target(remote)?;
+        // 功能：新文件按 0644 请求创建并由服务端 umask 收紧，覆盖时以 0600 暂存；时间：2026-11-26；作者：lq。
+        let replacing = self.upload_file_target(remote)?.is_some();
+        let creation_mode = if replacing { 0o600 } else { 0o644 };
         let temporary = temporary_path(remote)?;
         let result = (|| {
             let mut output = self
@@ -412,13 +416,16 @@ impl Client {
                 .open_mode(
                     &temporary,
                     OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUSIVE,
-                    0o600,
+                    creation_mode,
                     OpenType::File,
                 )
                 .map_err(|_| "无法创建远程临时文件")?;
             copy(&mut input, &mut output, progress)?;
-            // 功能：提交前重新检查目标类型；覆盖保留远端权限和属主，不沿用临时文件的 0600；时间：2026-11-16；作者：lq。
+            // 功能：提交前复核目标，避免并发创建或删除使新建与覆盖的权限策略互换；时间：2026-11-26；作者：lq。
             let target = self.upload_file_target(remote)?;
+            if replacing != target.is_some() {
+                return Err(format!("上传目标已变化，请重试：{}", remote.display()));
+            }
             if let Some(stat) = &target {
                 let permissions = stat.perm.ok_or("无法读取原文件权限，未覆盖目标")? & 0o7777;
                 if stat.uid.is_none() || stat.gid.is_none() {

@@ -70,23 +70,8 @@ pub fn save_current(
         std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
             .map_err(|_| "草稿目录权限设置失败")?;
     }
-    let key = CredentialStore::draft_key()?;
-    let cipher = XChaCha20Poly1305::new_from_slice(&key).map_err(|_| "草稿密钥不可用")?;
-    let mut nonce = [0; 24];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
     let plain = Zeroizing::new(serde_json::to_vec(draft).map_err(|_| "草稿编码失败")?);
-    let encrypted = cipher
-        .encrypt(
-            XNonce::from_slice(&nonce),
-            Payload {
-                msg: &plain,
-                aad: AAD,
-            },
-        )
-        .map_err(|_| "草稿加密失败")?;
-    let mut bytes = b"QDS6D1".to_vec();
-    bytes.extend_from_slice(&nonce);
-    bytes.extend(encrypted);
+    let bytes = seal(&plain, AAD)?;
     let temporary = directory.join(format!("{}.tmp", uuid::Uuid::new_v4()));
     write_new(&temporary, &bytes)?;
     if revision.load(Ordering::SeqCst) != expected {
@@ -107,23 +92,7 @@ pub fn load(directory: &Path, connection: uuid::Uuid) -> Result<Option<Draft>, S
     if !path.exists() {
         return Ok(None);
     }
-    let bytes = read_bounded(&path)?;
-    if bytes.len() < 46 || &bytes[..6] != b"QDS6D1" {
-        return Err("草稿格式无效，原缓存已保留".into());
-    }
-    let key = CredentialStore::draft_key()?;
-    let cipher = XChaCha20Poly1305::new_from_slice(&key).map_err(|_| "草稿密钥不可用")?;
-    let plain = Zeroizing::new(
-        cipher
-            .decrypt(
-                XNonce::from_slice(&bytes[6..30]),
-                Payload {
-                    msg: &bytes[30..],
-                    aad: AAD,
-                },
-            )
-            .map_err(|_| "草稿认证失败，原缓存已保留")?,
-    );
+    let plain = open(&path, AAD)?;
     let draft: Draft = serde_json::from_slice(&plain).map_err(|_| "草稿内容无效")?;
     if draft.schema != 1 || draft.connection != connection {
         return Err("草稿版本或连接引用无效".into());
@@ -132,6 +101,42 @@ pub fn load(directory: &Path, connection: uuid::Uuid) -> Result<Option<Draft>, S
         .validate(draft.text.as_bytes())
         .map_err(|e| e.to_string())?;
     Ok(Some(draft))
+}
+
+/// 功能：复用系统凭据库及认证加密封装，关联数据区分不同用途；时间：2026-11-27；作者：lq。
+pub(crate) fn seal(plain: &[u8], aad: &[u8]) -> Result<Vec<u8>, String> {
+    let key = CredentialStore::draft_key()?;
+    let cipher = XChaCha20Poly1305::new_from_slice(&key).map_err(|_| "草稿密钥不可用")?;
+    let mut nonce = [0; 24];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let encrypted = cipher
+        .encrypt(XNonce::from_slice(&nonce), Payload { msg: plain, aad })
+        .map_err(|_| "草稿加密失败")?;
+    let mut bytes = b"QDS6D1".to_vec();
+    bytes.extend_from_slice(&nonce);
+    bytes.extend(encrypted);
+    Ok(bytes)
+}
+
+/// 功能：校验格式、读取上限与密文认证，失败时保留原文件；时间：2026-11-27；作者：lq。
+pub(crate) fn open(path: &Path, aad: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
+    let bytes = read_bounded(path)?;
+    if bytes.len() < 46 || &bytes[..6] != b"QDS6D1" {
+        return Err("草稿格式无效，原缓存已保留".into());
+    }
+    let key = CredentialStore::draft_key()?;
+    let cipher = XChaCha20Poly1305::new_from_slice(&key).map_err(|_| "草稿密钥不可用")?;
+    Ok(Zeroizing::new(
+        cipher
+            .decrypt(
+                XNonce::from_slice(&bytes[6..30]),
+                Payload {
+                    msg: &bytes[30..],
+                    aad,
+                },
+            )
+            .map_err(|_| "草稿认证失败，原缓存已保留")?,
+    ))
 }
 
 /// 功能：成功保存或明确丢弃后移除单个草稿缓存；时间：2026-11-10；作者：lq。

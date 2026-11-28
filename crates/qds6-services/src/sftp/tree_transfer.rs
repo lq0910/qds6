@@ -97,6 +97,13 @@ impl Plan {
 }
 
 impl Client {
+    /// 功能：上传目录按 0755 请求创建，由服务端 umask 收紧，允许其他账号按权限穿越；时间：2026-11-26；作者：lq。
+    fn mkdir_for_upload(&self, path: &Path) -> Result<(), String> {
+        self.sftp
+            .mkdir(path, 0o755)
+            .map_err(|_| format!("创建远程上传目录失败：{}", path.display()))
+    }
+
     /// 功能：已有文件夹合并上传，保留远端独有内容；新文件夹暂存完成后发布；时间：2026-11-16；作者：lq。
     pub fn upload_path(
         &self,
@@ -117,12 +124,21 @@ impl Client {
             }
             return self.merge_upload(local, remote, &plan, progress);
         }
+        // 功能：目标已被移动或删除时保留检查点，交由用户按新路径重传；时间：2026-11-27；作者：lq。
+        if !progress
+            .published
+            .lock()
+            .map_err(|_| "传输检查点不可用")?
+            .is_empty()
+        {
+            return Err("上次合并的目标目录已不存在，请核对后重新发起上传".into());
+        }
         let temporary = temporary_path(remote)?;
-        self.mkdir(&temporary)?;
+        self.mkdir_for_upload(&temporary)?;
         let result = (|| {
             for directory in plan.directories.iter().skip(1) {
                 progress.check()?;
-                self.mkdir(&temporary.join(directory))?;
+                self.mkdir_for_upload(&temporary.join(directory))?;
             }
             for file in &plan.files {
                 self.upload_file(&local.join(file), &temporary.join(file), progress, false)?;
@@ -178,11 +194,40 @@ impl Client {
                 match self.upload_target(&path)? {
                     Some(stat) if stat.is_dir() => {}
                     Some(_) => return Err(format!("上传目录类型已变化：{}", path.display())),
-                    None => self.mkdir(&path)?,
+                    None => self.mkdir_for_upload(&path)?,
                 }
             }
             for file in &plan.files {
-                self.upload_file(&local.join(file), &remote.join(file), progress, false)?;
+                progress.check()?;
+                let source = local.join(file);
+                let target = remote.join(file);
+                let published = progress
+                    .published
+                    .lock()
+                    .map_err(|_| "传输检查点不可用")?
+                    .contains(file);
+                if published {
+                    if self
+                        .upload_target(&target)?
+                        .is_none_or(|stat| !stat.is_file())
+                    {
+                        return Err(format!(
+                            "已完成目标已变化，请核对后重新上传：{}",
+                            target.display()
+                        ));
+                    }
+                    let bytes = std::fs::symlink_metadata(&source)
+                        .map_err(|_| "无法重新读取已完成源文件")?
+                        .len();
+                    progress.completed.fetch_add(bytes, Ordering::Relaxed);
+                    continue;
+                }
+                self.upload_file(&source, &target, progress, false)?;
+                progress
+                    .published
+                    .lock()
+                    .map_err(|_| "传输检查点不可用")?
+                    .insert(file.clone());
             }
             Ok(())
         })();

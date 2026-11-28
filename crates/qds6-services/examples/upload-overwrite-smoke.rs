@@ -49,7 +49,9 @@ fn main() {
     std::fs::write(&seed, "old content\n").unwrap();
     let target = remote.join("index.html");
     client.upload(&seed, &target, &Transfer::default()).unwrap();
-    client.chmod(&target, 0o644).unwrap();
+    // 功能：检查新文件在测试服务端可被其他账号读取，并用 0640 验证后续覆盖保留自定义权限；时间：2026-11-26；作者：lq。
+    assert_eq!(raw.lstat(&target).unwrap().perm.unwrap() & 0o7777, 0o644);
+    client.chmod(&target, 0o640).unwrap();
     let before = raw.lstat(&target).unwrap();
     std::fs::write(&seed, "new 中文\n").unwrap();
     client.upload(&seed, &target, &Transfer::default()).unwrap();
@@ -73,6 +75,12 @@ fn main() {
     client
         .upload_path(&tree, &remote_tree, &Transfer::default())
         .unwrap();
+    // 功能：验证首次发布的目录权限，并为合并保留权限测试设置自定义权限；时间：2026-11-26；作者：lq。
+    assert_eq!(
+        raw.lstat(&remote_tree).unwrap().perm.unwrap() & 0o7777,
+        0o755
+    );
+    client.chmod(&remote_tree, 0o750).unwrap();
     std::fs::write(&seed, "remote only").unwrap();
     client
         .upload(
@@ -98,6 +106,20 @@ fn main() {
             client.open_document(&remote_tree.join(path)).unwrap().text,
             expected
         );
+    }
+    // 功能：检查整目录新建与合并新增的静态资源权限；时间：2026-11-26；作者：lq。
+    for path in ["nested/file.txt", "new/file.txt"] {
+        let mode = raw.lstat(&remote_tree.join(path)).unwrap().perm.unwrap();
+        assert_eq!(mode & 0o7777, 0o644);
+    }
+    // 功能：验证合并保留已有目录权限，新增的子目录可被其他账号穿越；时间：2026-11-26；作者：lq。
+    assert_eq!(
+        raw.lstat(&remote_tree).unwrap().perm.unwrap() & 0o7777,
+        0o750
+    );
+    for path in ["nested", "nested/empty", "new", "new/empty"] {
+        let mode = raw.lstat(&remote_tree.join(path)).unwrap().perm.unwrap();
+        assert_eq!(mode & 0o7777, 0o755);
     }
     assert!(
         client

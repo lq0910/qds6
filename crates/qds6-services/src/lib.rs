@@ -4,6 +4,8 @@ pub mod backup;
 pub mod credentials;
 pub mod database;
 pub mod drafts;
+// 功能：本机加密 SQL 和快捷入口数据；时间：2026-11-27；作者：lq。
+pub mod local_tools;
 pub mod migration;
 pub mod sftp;
 pub mod ssh;

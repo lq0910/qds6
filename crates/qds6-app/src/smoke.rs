@@ -2,10 +2,13 @@
 
 use super::*;
 use gpui_kit::test::TestWindowExt;
+// 功能：验证快捷对话框及加密 SQL，使用测试密钥避开真实 Keychain；时间：2026-11-27；作者：lq。
+use gpui_kit::component::WindowExt;
 use std::sync::Arc;
 
 /// 功能：覆盖中文配置、验证失败、持久化、草稿保留与主题切换；时间：2026-11-10；作者：lq。
 pub fn run_ui_smoke() {
+    qds6_services::credentials::use_fixture_draft_key([71; 32]);
     // 功能：验证品牌、业务图标及默认组件资源均可离线加载，避免仅编译通过却显示空图标；时间：2026-11-10；作者：lq。
     for path in AppAssets.list("").expect("list embedded icons") {
         assert!(
@@ -122,8 +125,25 @@ pub fn run_ui_smoke() {
     })
     .unwrap();
     cx.run_until_parked();
-    cx.update(|cx| assert!(view.read(cx).sql_dirty));
+    // 功能：收藏正在编辑的 SQL，快速面板搜索并恢复，核对落盘后可重新读取；时间：2026-11-27；作者：lq。
+    cx.update_window(handle, |_, window, cx| {
+        view.update(cx, |state, cx| {
+            state.save_sql_now(cx);
+            state.favorite_current_sql(cx);
+        });
+        window.click("quick-open", cx);
+        window.render_frame(cx);
+        assert!(window.has_active_dialog(cx));
+        assert!(window.find("quick-search").visible());
+        window.input("SELECT '中文'", cx);
+        window.press("enter", cx);
+        assert!(!window.has_active_dialog(cx));
+    })
+    .unwrap();
     settle(&mut cx, handle, &view);
+    let tools = qds6_services::local_tools::load(&path.with_file_name("local-tools.qds6")).unwrap();
+    assert!(tools.draft.unwrap().contains("SELECT '中文', 42;"));
+    assert_eq!(tools.favorites.len(), 1);
     cx.capture_screenshot(handle)
         .unwrap()
         .save(output.join("sql-light.png"))
@@ -172,7 +192,10 @@ fn settle(cx: &mut HeadlessAppContext, handle: AnyWindowHandle, view: &Entity<Wo
         cx.run_until_parked();
         let pending = cx.update(|cx| {
             let state = view.read(cx);
-            state.loading || !state.settings.ready || state.settings.saving
+            state.loading
+                || !state.settings.ready
+                || state.settings.saving
+                || state.local_tools.saving()
         });
         if !pending {
             break;

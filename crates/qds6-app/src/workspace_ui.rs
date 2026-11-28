@@ -125,7 +125,7 @@ impl Workbench {
                     WorkspaceArea::Databases => "数据库 · 对象、SQL 与查询结果",
                 },
                 WorkspaceTarget::Connection => "编辑连接配置 · 保存不会自动连接",
-                WorkspaceTarget::Sql => "SQL 草稿 · 仅保留在本次会话",
+                WorkspaceTarget::Sql => "SQL 草稿 · 收藏和历史可从编辑器打开",
                 WorkspaceTarget::Backup => "导入与备份 · 先预览，再确认写入",
                 WorkspaceTarget::Settings => "设置 · 常用偏好、软件更新与关于 QDS6",
                 WorkspaceTarget::Database => "数据库 · 选择对象或直接编写 SQL",

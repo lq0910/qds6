@@ -45,7 +45,7 @@ cargo run -p qds6-app --example component-smoke --features ui-tests --locked
 
 Mac T004 组件验证已通过，详见 [组件验证记录](docs/m0/kit-components.md)。实验窗口独立于正式客户端，验证数据表不代表数据库查询功能已经实现。
 
-UI 验证使用临时数据库，不读取用户连接。实际客户端将非秘密配置存于系统本地应用数据目录下的 `QDS6/connections.sqlite3`；macOS 为 `~/Library/Application Support/QDS6/`，Windows 为 `%LOCALAPPDATA%\QDS6\`。SQL 草稿仅保留本次会话，可复制到外部保存；关闭有修改的窗口会询问是否丢弃。
+UI 验证使用临时数据库，不读取用户连接。实际客户端将非秘密配置存于系统本地应用数据目录下的 `QDS6/connections.sqlite3`；macOS 为 `~/Library/Application Support/QDS6/`，Windows 为 `%LOCALAPPDATA%\QDS6\`。当前源码将 SQL 草稿、收藏和查询历史加密保存在同目录的 `local-tools.qds6`，密钥由系统凭据库保护。保存失败时可复制到外部保存。
 
 真实服务联调用 `scripts/service-fixtures.sh` 启动专用回环 Docker 服务，再执行 `scripts/fixture-tls.sh` 安装测试 CA 并启用严格 TLS。仅这些容器使用公开测试密码，禁止将验收脚本指向业务服务。
 

@@ -171,6 +171,8 @@ impl Workbench {
                 ("import-finalshell", "FinalShell"),
                 ("import-filezilla", "FileZilla"),
                 ("import-navicat", "Navicat"),
+                // 功能：复用连接导入的路径选择、兼容报告及最终确认；时间：2026-11-27；作者：lq。
+                ("import-openssh", "OpenSSH"),
             ]
             .into_iter()
             .enumerate()
@@ -195,6 +197,8 @@ impl Workbench {
                     // 功能：按来源准确声明密码迁移能力，不将暂不支持说成技术不可迁移；时间：2026-11-11；作者：lq。
                     if matches!(self.services.import_source, 1 | 3) {
                         "连接与账号一并导入；已识别的保存密码确认后写入系统凭据库，私钥需重新选择。"
+                    } else if self.services.import_source == 4 {
+                        "选择 ~/.ssh/config，预览具体 Host 别名和单跳配置。"
                     } else {
                         "迁移受支持的连接字段与账号；此来源的密码需补填，私钥需重新选择。"
                     },
@@ -565,6 +569,7 @@ impl Workbench {
             qds6_services::migration::Source::FinalShell,
             qds6_services::migration::Source::FileZilla,
             qds6_services::migration::Source::Navicat,
+            qds6_services::migration::Source::OpenSsh,
         ][self.services.import_source];
         let path = PathBuf::from(self.services.backup_path.read(cx).value().as_str());
         // 功能：只对 Navicat 重新导入匹配旧版遗漏数据库名的连接，不提前修改本机配置；时间：2026-11-11；作者：lq。

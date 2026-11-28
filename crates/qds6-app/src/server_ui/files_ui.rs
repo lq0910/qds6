@@ -86,6 +86,15 @@ impl FileBrowser {
     pub(super) fn destination(&self) -> PathBuf {
         self.current.clone()
     }
+    /// 功能：收藏和终端定位仅使用已成功读取的当前目录；时间：2026-11-27；作者：lq。
+    pub(super) fn loaded_directory(&self) -> Option<&str> {
+        if !self.entries.contains_key(&self.current) {
+            return None;
+        }
+        self.current
+            .to_str()
+            .filter(|path| path.starts_with('/') && !path.contains(char::is_control))
+    }
     /// 功能：仅从当前目录解析选中项，避免跨目录缓存产生错误操作；时间：2026-11-12；作者：lq。
     fn entry(&self, path: &Path) -> Option<sftp::Entry> {
         self.entries
@@ -136,6 +145,8 @@ struct TransferRequest {
     side: FileSide,
     source: PathBuf,
     target: PathBuf,
+    // 功能：保存待重试目录任务的检查点，不影响初次传输；时间：2026-11-27；作者：lq。
+    previous: Option<sftp::Transfer>,
 }
 impl TransferRequest {
     /// 功能：短状态文本保留方向与文件名；时间：2026-11-11；作者：lq。
@@ -166,6 +177,8 @@ pub(super) struct FilesUi {
     queue: VecDeque<TransferRequest>,
     active: Option<TransferRequest>,
     history: VecDeque<String>,
+    // 功能：失败任务保留源与目标，可从传输记录中单独重试；时间：2026-11-27；作者：lq。
+    failed: VecDeque<TransferRequest>,
     progress_task: Option<Task<()>>,
     subscriptions: Vec<Subscription>,
 }
@@ -197,6 +210,39 @@ impl FilesUi {
 }
 
 impl ServerWorkspace {
+    /// 功能：打开当前会话目录并复用已有路径校验；时间：2026-11-27；作者：lq。
+    pub(super) fn open_remote_directory(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if path == self.services.files.remote.current {
+            self.load_directory(FileSide::Remote, path, window, cx);
+        } else {
+            self.navigate_directory(FileSide::Remote, path, window, cx);
+        }
+    }
+
+    /// 功能：准备安全引用的 cd 命令并聚焦对应终端，由用户粘贴执行；时间：2026-11-27；作者：lq。
+    fn copy_terminal_directory(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.services.files.remote.loaded_directory() else {
+            self.status = "请先打开有效的远程目录".into();
+            cx.notify();
+            return;
+        };
+        if let Some(terminal) = &self.terminal {
+            cx.write_to_clipboard(ClipboardItem::new_string(format!(
+                "cd '{}'",
+                path.replace('\'', "'\\''")
+            )));
+            window.focus(&terminal.focus_handle(cx), cx);
+            self.status = "已复制切换目录命令；在 Shell 提示符粘贴后按回车".into();
+            self.error = false;
+            cx.notify();
+        }
+    }
+
     /// 功能：初始化双列表，各自持有焦点、路径及滚动，默认同时显示本地和远程；时间：2026-11-12；作者：lq。
     pub(super) fn new_files_ui(_window: &mut Window, cx: &mut Context<Self>) -> FilesUi {
         let browser = || FileBrowser {
@@ -220,6 +266,7 @@ impl ServerWorkspace {
             queue: VecDeque::new(),
             active: None,
             history: VecDeque::new(),
+            failed: VecDeque::new(),
             progress_task: None,
             subscriptions: Vec::new(),
         }
@@ -463,6 +510,7 @@ impl ServerWorkspace {
                         side: FileSide::Local,
                         source: path.clone(),
                         target: directory.join(path.file_name().unwrap()),
+                        previous: None,
                     },
                     window,
                     cx,
@@ -491,6 +539,7 @@ impl ServerWorkspace {
             side,
             source: entry.path,
             target,
+            previous: None,
         };
         self.enqueue_request(request, window, cx);
     }
@@ -512,6 +561,11 @@ impl ServerWorkspace {
         }) {
             self.status = "该传输已在队列中".into();
         } else {
+            files.failed.retain(|item| {
+                item.side != request.side
+                    || item.source != request.source
+                    || item.target != request.target
+            });
             files.queue.push_back(request);
             self.start_next_transfer(window, cx);
         }
@@ -530,7 +584,14 @@ impl ServerWorkspace {
             return;
         };
         self.services.busy = true;
-        self.services.transfer = sftp::Transfer::default();
+        self.services.transfer = sftp::Transfer {
+            published: request
+                .previous
+                .as_ref()
+                .map(|value| value.published.clone())
+                .unwrap_or_default(),
+            ..Default::default()
+        };
         let progress = self.services.transfer.clone();
         self.status = format!("{} → {}", request.label(), request.target.display()).into();
         self.error = false;
@@ -575,7 +636,20 @@ impl ServerWorkspace {
                     ),
                     Err(error) => {
                         this.error = true;
-                        format!("{}失败 · {error}", request.label())
+                        let mut failed = request.clone();
+                        failed.previous = Some(this.services.transfer.clone());
+                        this.services.files.failed.retain(|item| {
+                            item.source != failed.source
+                                || item.target != failed.target
+                                || item.side != failed.side
+                        });
+                        this.services.files.failed.push_front(failed);
+                        this.services.files.failed.truncate(20);
+                        format!(
+                            "{}失败 → {} · {error}",
+                            request.label(),
+                            request.target.display()
+                        )
                     }
                 };
                 this.status = message.clone().into();
@@ -586,7 +660,13 @@ impl ServerWorkspace {
                 } else {
                     FileSide::Local
                 };
-                if let Some(parent) = request.target.parent() {
+                // 功能：只刷新仍在查看的目标目录，避免批量完成时重复读取离开的目录；时间：2026-11-27；作者：lq。
+                if let Some(parent) = request.target.parent()
+                    && parent == this.services.files.browser(side).current
+                    && this.services.files.queue.front().is_none_or(|item| {
+                        item.side != request.side || item.target.parent() != Some(parent)
+                    })
+                {
                     this.load_directory(side, parent.into(), window, cx);
                 }
                 this.start_next_transfer(window, cx);
@@ -666,6 +746,18 @@ impl ServerWorkspace {
                         )
                     })
                     .child(div().flex_1())
+                    .when(side == FileSide::Remote && self.terminal.is_some(), |v| {
+                        v.child(
+                            Button::new("file-directory-to-terminal")
+                                .ghost()
+                                .xsmall()
+                                .icon(UiIcon::Terminal)
+                                .tooltip("复制当前目录的 cd 命令并聚焦终端")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.copy_terminal_directory(window, cx)
+                                })),
+                        )
+                    })
                     .child(
                         Button::new(SharedString::from(format!("select-all-{}", side.id())))
                             .ghost()
@@ -1051,12 +1143,34 @@ impl ServerWorkspace {
                                     })
                                     .collect();
                                 let history: Vec<_> = files.history.iter().cloned().collect();
+                                let failures = files.failed.clone();
+                                let view = cx.entity();
                                 move |mut menu, _, _| {
                                     if queue.is_empty() && history.is_empty() {
                                         menu = menu.item(PopupMenuItem::label("暂无传输记录"));
                                     }
                                     for item in queue.iter().chain(history.iter()) {
                                         menu = menu.item(PopupMenuItem::label(item.clone()));
+                                    }
+                                    for request in &failures {
+                                        let request = request.clone();
+                                        let view = view.clone();
+                                        menu = menu.item(
+                                            PopupMenuItem::new(format!(
+                                                "重试 · {} → {}",
+                                                request.label(),
+                                                request.target.display()
+                                            ))
+                                            .on_click(move |_, window, cx| {
+                                                view.update(cx, |this, cx| {
+                                                    this.enqueue_request(
+                                                        request.clone(),
+                                                        window,
+                                                        cx,
+                                                    );
+                                                });
+                                            }),
+                                        );
                                     }
                                     menu
                                 }

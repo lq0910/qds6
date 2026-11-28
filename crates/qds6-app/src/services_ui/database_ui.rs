@@ -4,6 +4,8 @@ use super::*;
 // 功能：表级菜单与导入导出向导；时间：2026-11-12；作者：lq。
 pub(super) mod actions;
 mod catalog;
+// 功能：原生数据库关系图和结构跳转；时间：2026-11-28；作者：lq。
+mod relationship_graph;
 // 功能：SQL 语法关键字与已连接数据库表名补全；时间：2026-11-13；作者：lq。
 // 功能：供工作台共享 SQL 补全类型；时间：2026-11-13；作者：lq。
 pub(crate) mod sql_completion;
@@ -786,7 +788,7 @@ impl Workbench {
             Some(if dirty {
                 "表中有未保存修改，关闭将丢弃这些修改；未提交事务将回滚。"
             } else {
-                "此连接的表标签将关闭，未提交事务将回滚。SQL 草稿保留在本次会话。"
+                "此连接的表标签将关闭，未提交事务将回滚。SQL 草稿仍可打开。"
             }),
             &["取消", "关闭连接"],
             cx,
@@ -880,6 +882,7 @@ impl Workbench {
                         self.services.database_context.1
                     )))
                     .child(div().flex_1())
+                    .child(self.sql_library_button(cx))
                     .child(
                         Button::new("run-sql")
                             .small()

@@ -6,6 +6,9 @@ pub use grid::{BrowseRequest, FilterOp, GridColumn, GridFilter, PAGE_SIZE, RowCh
 // 功能：对象属性、表级文件交换与 SQL 转储；时间：2026-11-12；作者：lq。
 mod transfer;
 pub use transfer::{TableProperties, TransferFormat, read_import};
+// 功能：按表读取两种数据库的物理外键关系；时间：2026-11-28；作者：lq。
+mod relationships;
+pub use relationships::{ForeignKey, ForeignKeyColumn, TableName, TableRelationships};
 
 use futures_util::TryStreamExt;
 use qds6_core::{ConnectionProfile, Protocol, TlsMode};

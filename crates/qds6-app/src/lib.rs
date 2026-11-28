@@ -32,6 +32,8 @@ mod workspace_ui;
 mod settings_ui;
 // 功能：连接文件夹分组与归组交互；时间：2026-11-11；作者：lq。
 mod connection_groups;
+// 功能：本机快捷打开、目录书签和 SQL 收藏历史；时间：2026-11-27；作者：lq。
+mod local_tools_ui;
 use assets::{AppAssets, BRAND_IMAGE, BRAND_MARK, UiIcon};
 
 /// 功能：协议统一使用语义图标，不依赖平台字体中的特殊字符；时间：2026-11-10；作者：lq。
@@ -52,12 +54,15 @@ gpui_kit::actions!(
         /// 功能：新建连接配置；时间：2026-11-10；作者：lq。
         NewConnection,
         /// 功能：保存连接配置；时间：2026-11-10；作者：lq。
-        SaveConnection
+        SaveConnection,
+        /// 功能：唤起连接、目录与 SQL 搜索；时间：2026-11-27；作者：lq。
+        QuickOpen
     ]
 );
 
 /// 功能：会话内初始 SQL，不连接或执行数据库；时间：2026-11-10；作者：lq。
-const INITIAL_SQL: &str = "-- SQL 草稿 · 仅保留在本次会话\n-- 功能：查询当前时间示例；时间：2026-11-10；作者：lq。\n-- 先连接数据库，再点击执行；选区存在时仅执行选区。\n\nSELECT\n    CURRENT_TIMESTAMP AS current_time;\n";
+// 功能：示例不反映实际草稿保存状态，状态由持久化结果决定；时间：2026-11-27；作者：lq。
+const INITIAL_SQL: &str = "-- 功能：查询当前时间示例；时间：2026-11-10；作者：lq。\n-- 先连接数据库，再点击执行；选区存在时仅执行选区。\n\nSELECT\n    CURRENT_TIMESTAMP AS current_time;\n";
 
 /// 功能：连接表单状态，与磁盘持久化结果分离；时间：2026-11-10；作者：lq。
 struct ProfileForm {
@@ -198,6 +203,8 @@ struct Workbench {
     services: services_ui::ServiceUi,
     // 功能：设置任务独立于连接、传输和查询任务；时间：2026-11-11；作者：lq。
     settings: settings_ui::SettingsUi,
+    // 功能：加密快捷数据的加载、草稿延迟保存和连接后导航；时间：2026-11-27；作者：lq。
+    local_tools: local_tools_ui::ToolsUi,
 }
 
 impl Workbench {
@@ -233,6 +240,7 @@ impl Workbench {
             cx.subscribe(&sql, |this, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     this.sql_dirty = true;
+                    this.queue_sql_draft(cx);
                     cx.notify();
                 }
             }),
@@ -266,11 +274,13 @@ impl Workbench {
             storage_path,
             services: services_ui::ServiceUi::new(window, cx),
             settings: settings_ui::SettingsUi::default(),
+            local_tools: Default::default(),
         };
         this.watch_form(cx);
         this.watch_system_appearance(window, cx);
         this.load(cx);
         this.load_preferences(window, cx);
+        this.load_local_tools(window, cx);
         this
     }
 
@@ -373,6 +383,29 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_profile_target(profile, connect, None, window, cx);
+    }
+
+    /// 功能：在确认丢弃连接表单之后才绑定需要打开的书签；时间：2026-11-27；作者：lq。
+    fn open_profile_bookmark(
+        &mut self,
+        profile: ConnectionProfile,
+        bookmark: qds6_services::local_tools::Bookmark,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_profile_target(profile, true, Some(bookmark), window, cx);
+    }
+
+    /// 功能：连接、编辑与书签复用同一表单保护和连接流程；时间：2026-11-27；作者：lq。
+    fn open_profile_target(
+        &mut self,
+        profile: ConnectionProfile,
+        connect: bool,
+        directory: Option<qds6_services::local_tools::Bookmark>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.saving || self.services.busy {
             return;
         }
@@ -387,6 +420,7 @@ impl Workbench {
             cx.spawn_in(window, async move |this, window| {
                 if answer.await == Ok(1) {
                     let _ = this.update_in(window, |this, window, cx| {
+                        this.local_tools.pending_directory = directory;
                         this.replace_form(profile, window, cx);
                         if connect {
                             this.connect_service(window, cx);
@@ -396,6 +430,7 @@ impl Workbench {
             })
             .detach();
         } else {
+            self.local_tools.pending_directory = directory;
             self.replace_form(profile, window, cx);
             if connect {
                 self.connect_service(window, cx);
@@ -561,7 +596,9 @@ impl Workbench {
 
     /// 功能：菜单、快捷键和窗口关闭共用同一丢弃确认；时间：2026-11-10；作者：lq。
     fn allow_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.flush_sql_draft(cx);
         if self.saving
+            || self.local_tools.saving()
             || self.groups.busy
             || self.services.busy
             || self
@@ -590,7 +627,7 @@ impl Workbench {
         let answer = window.prompt(
             PromptLevel::Warning,
             "关闭 QDS6？",
-            Some("活动会话将断开；未保存的连接、分组名称、SQL 和远程文件草稿将被丢弃。请先保存或复制需要保留的内容。"),
+            Some("活动会话将断开，尚未保存的修改会丢失。请先保存或复制需要保留的内容。"),
             &["取消", "丢弃并关闭"],
             cx,
         );
@@ -1206,7 +1243,7 @@ impl Workbench {
                                         cx.write_to_clipboard(ClipboardItem::new_string(
                                             text.to_string(),
                                         ));
-                                        this.status = "SQL 已复制 · 草稿仍仅保留在本次会话".into();
+                                        this.status = "SQL 已复制".into();
                                         this.error = false;
                                     }
                                     Err(error) => {
@@ -1217,6 +1254,7 @@ impl Workbench {
                                 cx.notify();
                             })),
                     )
+                    .child(self.sql_library_button(cx))
                     .when(self.services.busy && connected, |v| {
                         v.child(
                             Button::new("cancel-query")
@@ -1295,6 +1333,7 @@ impl Render for Workbench {
                                         .child("本地工作区"),
                                 ),
                         )
+                        .child(self.quick_open_button(cx))
                         .child(
                             Button::new("theme")
                                 .ghost()
@@ -1397,22 +1436,25 @@ impl Render for Workbench {
 pub fn run() {
     gpui_kit::application().with_assets(AppAssets).run(|cx| {
         gpui_kit::init(cx);
-        let [quit, close, new, save] = if cfg!(target_os = "macos") {
-            ["cmd-q", "cmd-w", "cmd-n", "cmd-s"]
+        // 功能：快捷打开沿用平台主修饰键；时间：2026-11-27；作者：lq。
+        let [quit, close, new, save, quick] = if cfg!(target_os = "macos") {
+            ["cmd-q", "cmd-w", "cmd-n", "cmd-s", "cmd-k"]
         } else {
-            ["ctrl-q", "ctrl-w", "ctrl-n", "ctrl-s"]
+            ["ctrl-q", "ctrl-w", "ctrl-n", "ctrl-s", "ctrl-k"]
         };
         cx.bind_keys([
             KeyBinding::new(quit, CloseWorkspace, None),
             KeyBinding::new(close, CloseWorkspace, None),
             KeyBinding::new(new, NewConnection, None),
             KeyBinding::new(save, SaveConnection, None),
+            KeyBinding::new(quick, QuickOpen, None),
         ]);
         cx.set_menus([
             Menu::new("QDS6").items([MenuItem::action("退出 QDS6", CloseWorkspace)]),
             Menu::new("连接").items([
                 MenuItem::action("新建连接", NewConnection),
                 MenuItem::action("保存连接", SaveConnection),
+                MenuItem::action("快速打开…", QuickOpen),
             ]),
             Menu::new("编辑").items([
                 MenuItem::action("撤销", component::input::Undo),
@@ -1441,6 +1483,14 @@ pub fn run() {
             window.on_window_should_close(cx, move |window, cx| {
                 weak.update(cx, |state, cx| state.allow_close(window, cx))
                     .unwrap_or(true)
+            });
+            let weak = view.downgrade();
+            cx.on_action(move |_: &QuickOpen, cx| {
+                if let Some(window) = cx.active_window() {
+                    let _ = window.update(cx, |_, window, cx| {
+                        let _ = weak.update(cx, |state, cx| state.open_quick_dialog(window, cx));
+                    });
+                }
             });
             let weak = view.downgrade();
             cx.on_action(move |_: &CloseWorkspace, cx| {
@@ -1485,10 +1535,10 @@ pub fn run() {
                                 {
                                     server.update(cx, |server, cx| server.save_remote(window, cx));
                                 }
-                            } else {
-                                state.status =
-                                    "SQL 草稿仅保留本次会话，请使用「复制 SQL」另行保存".into();
-                                cx.notify();
+                            } else if state.tab == 2
+                                || (state.tab == 3 && state.services.query_active)
+                            {
+                                state.save_sql_now(cx);
                             }
                         });
                     });

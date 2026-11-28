@@ -40,6 +40,8 @@ fn settle(cx: &mut HeadlessAppContext, handle: AnyWindowHandle, view: &Entity<Wo
 
 /// 功能：实际连接后自动对象、双击表、独立草稿、行内保存、布局拖动和关闭确认验收；时间：2026-11-11；作者：lq。
 pub fn run_database_grid_smoke() {
+    // 功能：原生图和数据库验收共用隔离草稿密钥，不读写用户 Keychain；时间：2026-11-28；作者：lq。
+    qds6_services::credentials::use_fixture_draft_key([82; 32]);
     let mut profile = ConnectionProfile::new(Protocol::PostgreSql);
     profile.name = "隔离 PostgreSQL · 表操作验收".into();
     profile.host = "127.0.0.1".into();
@@ -817,6 +819,7 @@ pub fn run_database_grid_smoke() {
     })
     .unwrap();
     settle(&mut cx, handle, &view);
+    check_relationship_graph(&mut cx, handle, &view, &db);
     cx.update_window(handle, |_, window, cx| {
         window.click(("close-table", 1usize), cx);
         assert_eq!(view.read(cx).services.table_tabs.len(), 1);
@@ -856,6 +859,71 @@ pub fn run_database_grid_smoke() {
     println!(
         "PASS native database UI: automatic objects and clipped catalog, wide/empty table horizontal wheel and scrollbar drag to final column, field comments, Enter filter/reset, filter builder/sort, inline field edit/add/type dropdown/length-scale/NULL/direct structure save, failure retry and structure dirty-close protection, context close-right/others/all with dirty cancel/confirm, grid insert/update/delete/default/save, 1440/960 layouts and disconnect protection"
     );
+}
+
+/// 功能：通过真实右键打开外键图，在最小窗口验收字段映射和结构跳转；时间：2026-11-28；作者：lq。
+fn check_relationship_graph(
+    cx: &mut HeadlessAppContext,
+    handle: AnyWindowHandle,
+    view: &Entity<Workbench>,
+    db: &DatabaseSession,
+) {
+    db.query("ALTER TABLE public.ui_grid_a ADD COLUMN graph_reference INTEGER, ADD CONSTRAINT ui_graph_fk FOREIGN KEY (graph_reference) REFERENCES public.ui_grid_b (id) ON UPDATE CASCADE").unwrap();
+    let index = cx.update(|cx| {
+        view.read(cx)
+            .services
+            .tables
+            .iter()
+            .position(|table| table.name == "ui_grid_a")
+            .unwrap()
+    });
+    cx.update_window(handle, |_, window, cx| {
+        window.resize(size(px(960.), px(640.)));
+        window.bounds_changed(cx);
+    })
+    .unwrap();
+    settle(cx, handle, view);
+    cx.update_window(handle, |_, window, cx| {
+        window.right_click(("database-object", index), cx)
+    })
+    .unwrap();
+    settle(cx, handle, view);
+    cx.update_window(handle, |_, window, cx| {
+        click_menu_label(window, "查看关系图", cx)
+    })
+    .unwrap();
+    settle(cx, handle, view);
+    cx.update_window(handle, |_, window, _| {
+        let canvas = window.find("relationship-canvas");
+        assert!(canvas.visible());
+        assert!(canvas.bounds().right() < window.viewport_size().width);
+        assert!(window.find("relationship-details").visible());
+        assert!(window.find(("relationship-structure", 0usize)).visible());
+    })
+    .unwrap();
+    cx.capture_screenshot(handle)
+        .unwrap()
+        .save("output/database-grid/relationship-graph.png")
+        .unwrap();
+    cx.update_window(handle, |_, window, cx| {
+        window.click(("relationship-structure", 0usize), cx)
+    })
+    .unwrap();
+    settle(cx, handle, view);
+    cx.update(|cx| {
+        let service = &view.read(cx).services;
+        let active = &service.table_tabs[service.active_table_tab.unwrap()];
+        assert_eq!(active.table.name, "ui_grid_b");
+        assert!(active.designing);
+    });
+    db.query("ALTER TABLE public.ui_grid_a DROP COLUMN graph_reference")
+        .unwrap();
+    cx.update_window(handle, |_, window, cx| {
+        window.resize(size(px(1440.), px(900.)));
+        window.bounds_changed(cx);
+    })
+    .unwrap();
+    settle(cx, handle, view);
 }
 
 /// 功能：仅验收环境的原生确认按钮，向 GPUI 发送标准响应；时间：2026-11-11；作者：lq。
