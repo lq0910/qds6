@@ -6012,7 +6012,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "qds6-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6030,7 +6030,7 @@ dependencies = [
 
 [[package]]
 name = "qds6-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -6040,7 +6040,7 @@ dependencies = [
 
 [[package]]
 name = "qds6-services"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes",
  "alacritty_terminal",
@@ -6077,7 +6077,7 @@ dependencies = [
 
 [[package]]
 name = "qds6-storage"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "qds6-core",
  "rusqlite",

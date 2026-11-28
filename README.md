@@ -10,9 +10,9 @@ Connections, simplified.
 
 终端、文件与数据库，一个工作台。使用 Rust + GPUI Kit 开发，先完成 macOS 主要功能，再启动 Windows 适配；最终平台范围为 macOS 和 Windows。
 
-当前为 **0.1.0 Mac 首个内部可用版本**。已实现 SSH 终端、SFTP 传输和远程编辑、MySQL/PostgreSQL 查询与基础修改、Keychain 凭据、导入预览、配置导出及加密备份恢复。保存连接不联网，点击「连接」后才连接。Mac 的完整专项验收和 Windows 仍有待办，不代表 M0–M4 所有项目完成。
+当前版本为 **0.1.1 macOS 内测版**。本次变更见 [0.1.1 更新说明](docs/releases/0.1.1.md)。已实现 SSH 终端、SFTP 传输和远程编辑、MySQL/PostgreSQL 查询与基础修改、Keychain 凭据、导入预览、配置导出及加密备份恢复。保存连接不联网，点击「连接」后才连接。Mac 的完整专项验收和 Windows 仍有待办，不代表 M0–M4 所有项目完成。
 
-安装及操作见 [Mac 使用说明](docs/macos-first-release/使用说明.md)，分项证据和限制见 [首包验收记录](docs/macos-first-release/README.md)。包位于 `output/release/0.1.0-macos-arm64-internal/`，仅 Apple Silicon，ad-hoc 内部签名，未公证。
+安装及操作见 [Mac 使用说明](docs/macos-first-release/使用说明.md)，分项证据和限制见 [首包验收记录](docs/macos-first-release/README.md)。GitHub Actions 为 Apple Silicon 和 Intel Mac 生成内测安装包。首包记录对应 Apple Silicon 的 0.1.0 本地构建。
 
 ## 开发
 

@@ -170,6 +170,14 @@ jobs:
           python3 scripts/prepare-macos-release.py --directory artifacts --output release-assets \
             --version "$PACKAGE_VERSION" --commit "$GITHUB_SHA" --build-number "$GITHUB_RUN_ID" \
             --signing-mode "$SIGNING_MODE"
+      # 功能：将当前版本的更新说明追加到 GitHub Release 和随包说明；时间：2026-11-28；作者：lq。
+      - name: Include version changelog
+        run: |
+          changelog="docs/releases/${PACKAGE_VERSION}.md"
+          if [ -f "$changelog" ]; then
+            printf '\n' >> release-assets/RELEASE-NOTES.md
+            cat "$changelog" >> release-assets/RELEASE-NOTES.md
+          fi
       - name: Create tag and publish complete release
         run: |
           # 功能：拒绝错指提交及已公开的 tag，上传完成才公开；失败可重跑草稿；时间：2026-11-13；作者：lq。
